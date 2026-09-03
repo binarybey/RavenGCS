@@ -67,3 +67,7 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# Input files
+terrain_data.bin
+map_chunks_19x2/
