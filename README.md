@@ -31,7 +31,7 @@ Install Python 3.x if you do not already have it. Critical for Windows users: Yo
 
 Open your terminal or command prompt in the RAVEN directory.
 
-Install the required Python packages by running: pip install -r requirements.txt
+Install the required Python packages by running: python -m pip install -r requirements.txt
 
 Run the compiler script: python build_map.py
 
