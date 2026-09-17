@@ -31,6 +31,8 @@ Install Python 3.x if you do not already have it.
 
 Open your terminal or command prompt in the RAVEN directory.
 
+Install the required Python packages by running: pip install -r requirements.txt
+
 Run the compiler script: python build_map.py
 
 Wait for the script to unpack the archives, parse the GeoTiffs, and generate the map elevation files and the 5.5GB terrain_data.bin file.
