@@ -27,7 +27,7 @@ Rename the three downloaded files are named exactly as follows: northern.tar.gz,
 Phase 2: Compiling the Map
 Once the raw elevation data is secured, it must be compiled into RAVEN's custom binary format and PNG tiles.
 
-Install Python 3.x if you do not already have it.
+Install Python 3.x if you do not already have it. Critical for Windows users: You must check the box that says "Add python.exe to PATH" at the bottom of the installer window before clicking Install.
 
 Open your terminal or command prompt in the RAVEN directory.
 
