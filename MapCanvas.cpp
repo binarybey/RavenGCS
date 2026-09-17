@@ -15,6 +15,20 @@
 
 namespace MapCanvas {
 
+    enum class AppState {
+        IDLE,             // Default Line mode
+        WAITING_3PT_1,    // Waiting for WP 1 (Start)
+        WAITING_3PT_2,    // Waiting for WP 2 (Mid/Pass-through)
+        WAITING_3PT_3,    // Waiting for WP 3 (End)
+        WAITING_CENTER_1, // Waiting for Start Anchor
+        WAITING_CENTER_2,  // Waiting for True Center
+        ADJUSTING_CENTER_ARC // Real-time slider state
+    };
+
+    static AppState current_state = AppState::IDLE;
+    static int current_arc_group = 1;
+    static std::vector<Waypoint> temp_arc_points;
+
     bool show_minute_grid = true;
     bool show_second_grid = true;
     std::vector<Waypoint> waypoints;
@@ -33,6 +47,7 @@ namespace MapCanvas {
     static int mode_threshold = 15;
     static int tile_offset = 3;
     static int step_grouping = 3;
+    static int path_geometry_mode = 0; // 0: Straight, 1: 3-Point Arc, 2: Center Arc
 
     // Virtual Camera State
     static float zoom = 0.012f;
@@ -147,7 +162,7 @@ namespace MapCanvas {
 
             // Format the text and calculate its exact pixel width
             char text_buf[128];
-            snprintf(text_buf, sizeof(text_buf), "Parsing High-Resolution Topography (%d/38 Chunks)...", loaded_chunks.load());
+            snprintf(text_buf, sizeof(text_buf), "Parsing Topography Elements (%d/38)", loaded_chunks.load());
             float text_width = ImGui::CalcTextSize(text_buf).x;
             float bar_width = 400.0f;
 
@@ -218,7 +233,16 @@ namespace MapCanvas {
             zoom = new_zoom;
         }
 
+        // --- CAMERA CLAMPING ---
+        // Prevent the center of the screen from leaving the map boundaries
+        float half_w = (canvas_sz.x * 0.5f) / zoom;
+        float half_h = (canvas_sz.y * 0.5f) / zoom;
 
+        if (scroll_pos.x > half_w) scroll_pos.x = half_w;
+        if (scroll_pos.x < -68400.0f + half_w) scroll_pos.x = -68400.0f + half_w;
+
+        if (scroll_pos.y > half_h) scroll_pos.y = half_h;
+        if (scroll_pos.y < -21600.0f + half_h) scroll_pos.y = -21600.0f + half_h;
 
         // --- RENDERING PHASE ---
         draw_list->PushClipRect(canvas_p0, canvas_p1, true);
@@ -243,6 +267,11 @@ namespace MapCanvas {
         }
 
         // 6. Waypoint Selection (Left Click = Add, Right Click = Remove)
+        // Handle Escape Key: Cancel ongoing operations
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape) && current_state != AppState::IDLE) {
+            current_state = AppState::IDLE;
+            temp_arc_points.clear();
+        }
         if (is_hovered) {
             // Left Click: Drop waypoint snapped to the arc-second tile
             if (zoom > 15.0f && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
@@ -268,8 +297,69 @@ namespace MapCanvas {
                         wp.raw_y = (float)tile_y;
                         wp.lon_sec = (26 * 3600) + tile_x;
                         wp.lat_sec = (42 * 3600) - tile_y;
-                        waypoints.push_back(wp);
-                        SaveSession();
+
+                        if (current_state == AppState::IDLE) {
+                            // Standard Line Mode
+                            wp.type = WpType::Standard;
+                            waypoints.push_back(wp);
+                            SaveSession();
+                        }
+                        else if (current_state >= AppState::WAITING_3PT_1 && current_state <= AppState::WAITING_3PT_3) {
+                            // 3-Point Arc Mode
+                            wp.type = WpType::Arc3Pt;
+                            wp.group_id = current_arc_group;
+
+                            if (current_state == AppState::WAITING_3PT_1) {
+                                int max_id = 0;
+                                for (const auto& w : waypoints) {
+                                    if (w.group_id > max_id) max_id = w.group_id;
+                                }
+                                current_arc_group = max_id + 1;
+                                wp.group_id = current_arc_group; 
+                                wp.group_index = 1;
+                                temp_arc_points.push_back(wp);
+                                current_state = AppState::WAITING_3PT_2;
+                            }
+                            else if (current_state == AppState::WAITING_3PT_2) {
+                                wp.group_index = 2;
+                                temp_arc_points.push_back(wp);
+                                current_state = AppState::WAITING_3PT_3;
+                            }
+                            else if (current_state == AppState::WAITING_3PT_3) {
+                                wp.group_index = 3;
+                                temp_arc_points.push_back(wp);
+
+                                // Finalize the arc: move from temp buffer to main array
+                                for (const auto& p : temp_arc_points) waypoints.push_back(p);
+
+                                current_arc_group++;
+                                temp_arc_points.clear();
+                                current_state = AppState::IDLE; // Snap back to standard line mode
+                                SaveSession();
+                            }
+                        }
+                        else if (current_state == AppState::WAITING_CENTER_1) {
+                            int max_id = 0;
+                            for (const auto& w : waypoints) {
+                                if (w.group_id > max_id) max_id = w.group_id;
+                            }
+                            current_arc_group = max_id + 1;
+
+                            wp.type = WpType::ArcCenterAnchor;
+                            wp.group_id = current_arc_group;
+                            wp.group_index = 1;
+                            temp_arc_points.push_back(wp);
+                            current_state = AppState::WAITING_CENTER_2;
+                        }
+                        else if (current_state == AppState::WAITING_CENTER_2) {
+                            wp.type = WpType::ArcCenterEnd;
+                            wp.group_id = current_arc_group;
+                            wp.group_index = 2;
+                            wp.center_angle = 90.0f; // Default live starting angle
+                            temp_arc_points.push_back(wp);
+
+                            current_state = AppState::ADJUSTING_CENTER_ARC; // Trigger the slider
+                        }
                     }
                 }
             }
@@ -285,11 +375,9 @@ namespace MapCanvas {
                     bool hit = false;
 
                     if (zoom > 15.0f) {
-                        // Zoomed In: Clean tile-based collision detection
                         if ((int)it->raw_x == click_tile_x && (int)it->raw_y == click_tile_y) hit = true;
                     }
                     else {
-                        // Zoomed Out: Radius-based collision for pins
                         float center_x = map_origin.x + (it->raw_x + 0.5f) * zoom;
                         float center_y = map_origin.y + (it->raw_y + 0.5f) * zoom;
                         float dx = io.MousePos.x - center_x;
@@ -298,9 +386,23 @@ namespace MapCanvas {
                     }
 
                     if (hit) {
-                        it = waypoints.erase(it);
+                        // --- SMART DELETION LOGIC ---
+                        if (it->type != WpType::Standard && it->group_id != -1) {
+                            // It's an Arc: Nuke the entire connected group
+                            int target_id = it->group_id;
+                            waypoints.erase(
+                                std::remove_if(waypoints.begin(), waypoints.end(),
+                                    [target_id](const Waypoint& wp) { return wp.group_id == target_id; }),
+                                waypoints.end()
+                            );
+                        }
+                        else {
+                            // It's a Standard Line: Surgically remove just this one point
+                            waypoints.erase(it);
+                        }
+
                         SaveSession();
-                        break; // Only erase one per click
+                        break;
                     }
                     else {
                         ++it;
@@ -347,7 +449,7 @@ namespace MapCanvas {
                     draw_list->AddText(ImVec2(canvas_p0.x + 5, y + 5), textColor, label);
                 }
             }
-        }// (0, 64, 128, 95)
+        }
 
         // --- DRAW ARC-MINUTES ---
         if (show_minute_grid && minStep > 10.0f) {
@@ -554,132 +656,147 @@ namespace MapCanvas {
         // ==========================================
         // PASS 1: DRAW PATHS & HIGHLIGHTS (BOTTOM LAYER)
         // ==========================================
-        for (size_t i = 1; i < waypoints.size(); i++) {
+        std::vector<ImVec2> flight_path = GenerateFlightPath();
 
-            float center_x = map_origin.x + (waypoints[i].raw_x + 0.5f) * zoom;
-            float center_y = map_origin.y + (waypoints[i].raw_y + 0.5f) * zoom;
-
-            int start_x = (int)waypoints[i - 1].raw_x;
-            int start_y = (int)waypoints[i - 1].raw_y;
-            int end_x = (int)waypoints[i].raw_x;
-            int end_y = (int)waypoints[i].raw_y;
-
-            int dx = end_x - start_x;
-            int dy = end_y - start_y;
-            int step_x = (dx > 0) ? 1 : ((dx < 0) ? -1 : 0);
-            int step_y = (dy > 0) ? 1 : ((dy < 0) ? -1 : 0);
-
-            bool is_x_parent = abs(dx) >= abs(dy);
-            double abs_dx = fabs((double)dx), abs_dy = fabs((double)dy);
-            double tDeltaX = (abs_dx == 0) ? 1e30 : 1.0 / abs_dx, tDeltaY = (abs_dy == 0) ? 1e30 : 1.0 / abs_dy;
-            double tMaxX = (abs_dx == 0) ? 1e30 : 0.5 / abs_dx, tMaxY = (abs_dy == 0) ? 1e30 : 0.5 / abs_dy;
-
-            int current_x = start_x, current_y = start_y;
-            int total_crossings = (int)(abs_dx + abs_dy);
-
+        if (flight_path.size() > 1) {
             // --- UI Grouping Logic ---
             struct UITile { int x, y; };
             struct UIFlightStep {
                 std::vector<UITile> tiles;
                 float sum_elev;
                 int tile_count;
+                size_t path_idx;
+                float t_start;
+                float t_end;
             };
             std::vector<UIFlightStep> ui_steps;
 
-            int prev_parent = is_x_parent ? current_x : current_y;
             UIFlightStep current_step;
             current_step.sum_elev = 0.0f;
             current_step.tile_count = 0;
+            int prev_parent = -1;
 
-            auto add_ui_tile = [&](int cx, int cy) {
+            auto add_ui_tile = [&](int cx, int cy, bool is_x_parent, size_t path_idx, float t) {
                 int current_parent = is_x_parent ? cx : cy;
+
+                if (prev_parent == -1) {
+                    prev_parent = current_parent;
+                    current_step.path_idx = path_idx;
+                    current_step.t_start = t;
+                }
+
                 if (current_parent != prev_parent) {
-                    ui_steps.push_back(current_step);
+                    // Close the old step bridging perfectly to 't'
+                    current_step.t_end = t;
+                    if (current_step.tile_count > 0) ui_steps.push_back(current_step);
+
+                    // Open the new step starting perfectly at 't'
                     current_step = UIFlightStep();
                     current_step.sum_elev = 0.0f;
                     current_step.tile_count = 0;
+                    current_step.path_idx = path_idx;
+                    current_step.t_start = t;
                     prev_parent = current_parent;
                 }
+
                 float elev = (elevation_data != nullptr) ? elevation_data[(size_t)cy * 68400 + (size_t)cx] : 0.0f;
                 current_step.sum_elev += elev;
                 current_step.tile_count++;
                 current_step.tiles.push_back({ cx, cy });
+
+                // Keep stretching the end of the current block
+                current_step.t_end = t;
                 };
 
-            add_ui_tile(current_x, current_y);
+            for (size_t i = 1; i < flight_path.size(); i++) {
+                float fx1 = flight_path[i - 1].x;
+                float fy1 = flight_path[i - 1].y;
+                float fx2 = flight_path[i].x;
+                float fy2 = flight_path[i].y;
 
-            for (int step = 0; step < total_crossings; step++) {
-                if (current_x == end_x && current_y == end_y) break;
-                if (fabs(tMaxX - tMaxY) < 1e-8) {
-                    current_x += step_x; current_y += step_y;
-                    tMaxX += tDeltaX; tMaxY += tDeltaY;
-                    step++; add_ui_tile(current_x, current_y);
-                }
-                else if (tMaxX < tMaxY) {
-                    current_x += step_x; tMaxX += tDeltaX; add_ui_tile(current_x, current_y);
+                int start_x = (int)fx1;
+                int start_y = (int)fy1;
+                int end_x = (int)fx2;
+                int end_y = (int)fy2;
+
+                if (start_x == end_x && start_y == end_y) {
+                    add_ui_tile(start_x, start_y, true, i, 0.0f);
                 }
                 else {
-                    current_y += step_y; tMaxY += tDeltaY; add_ui_tile(current_x, current_y);
+                    int dx = end_x - start_x;
+                    int dy = end_y - start_y;
+                    int step_x = (dx > 0) ? 1 : ((dx < 0) ? -1 : 0);
+                    int step_y = (dy > 0) ? 1 : ((dy < 0) ? -1 : 0);
+                    bool is_x_parent = std::abs(dx) >= std::abs(dy);
+
+                    double abs_dx = std::abs((double)dx), abs_dy = std::abs((double)dy);
+                    double tDeltaX = (abs_dx == 0) ? 1e30 : 1.0 / abs_dx;
+                    double tDeltaY = (abs_dy == 0) ? 1e30 : 1.0 / abs_dy;
+                    double tMaxX = (abs_dx == 0) ? 1e30 : 0.5 / abs_dx;
+                    double tMaxY = (abs_dy == 0) ? 1e30 : 0.5 / abs_dy;
+
+                    int current_x = start_x, current_y = start_y;
+                    int total_crossings = (int)(abs_dx + abs_dy);
+
+                    add_ui_tile(current_x, current_y, is_x_parent, i, 0.0f);
+
+                    for (int step = 0; step < total_crossings; step++) {
+                        if (current_x == end_x && current_y == end_y) break;
+                        if (std::abs(tMaxX - tMaxY) < 1e-8) {
+                            current_x += step_x; current_y += step_y;
+                            tMaxX += tDeltaX; tMaxY += tDeltaY;
+                            step++;
+                        }
+                        else if (tMaxX < tMaxY) {
+                            current_x += step_x; tMaxX += tDeltaX;
+                        }
+                        else {
+                            current_y += step_y; tMaxY += tDeltaY;
+                        }
+
+                        float t = (float)(step + 1) / (float)total_crossings;
+                        add_ui_tile(current_x, current_y, is_x_parent, i, t);
+                    }
+                }
+
+                // Force close the step at the exact end of the segment to prevent cross-segment contamination
+                if (current_step.tile_count > 0) {
+                    current_step.t_end = 1.0f;
+                    ui_steps.push_back(current_step);
+                    current_step = UIFlightStep();
+                    current_step.sum_elev = 0.0f;
+                    current_step.tile_count = 0;
+                    prev_parent = -1;
                 }
             }
-            ui_steps.push_back(current_step);
 
-            // --- 1. Mode Calculation (Grouped Step Strict Derivative) ---
+            // --- 1. Mode Calculation ---
             std::vector<int> raw_modes(ui_steps.size(), 0);
             int current_mode = 0;
             float prev_group_elev = 0.0f;
-
-            // Iterate through the path in chunks defined by the slider
             for (size_t i = 0; i < ui_steps.size(); i += step_grouping) {
-
                 float group_sum_elev = 0.0f;
                 int group_tile_count = 0;
-
-                // Prevent array out-of-bounds on the final chunk
                 size_t end_idx = (i + step_grouping < ui_steps.size()) ? i + step_grouping : ui_steps.size();
-
-                // Aggregate elevations and actual tile counts for the entire group
                 for (size_t s = i; s < end_idx; s++) {
                     group_sum_elev += ui_steps[s].sum_elev;
                     group_tile_count += ui_steps[s].tile_count;
                 }
-
-                // Average with respect to TOTAL TILE COUNT of the group
                 float current_group_elev = group_sum_elev / (float)group_tile_count;
-
-                // Initialize the previous elevation on the very first group
-                if (i == 0) {
-                    prev_group_elev = current_group_elev;
-                }
-
+                if (i == 0) prev_group_elev = current_group_elev;
                 float delta_z = current_group_elev - prev_group_elev;
 
-                // Apply your strict entry and half-threshold exit rules
-                if (current_mode == 0) { // Flat
-                    if (delta_z > (float)mode_threshold) {
-                        current_mode = 1; // Start Climb
-                    }
-                    else if (delta_z < -(float)mode_threshold) {
-                        current_mode = 2; // Start Glide
-                    }
+                if (current_mode == 0) {
+                    if (delta_z > (float)mode_threshold) current_mode = 1;
+                    else if (delta_z < -(float)mode_threshold) current_mode = 2;
                 }
-                else if (current_mode == 1) { // Climb
-                    if (delta_z < ((float)mode_threshold * 0.5f)) {
-                        current_mode = 0; // Terrain slacked off: Terminate climb, go flat
-                    }
+                else if (current_mode == 1) {
+                    if (delta_z < ((float)mode_threshold * 0.5f)) current_mode = 0;
                 }
-                else if (current_mode == 2) { // Glide
-                    if (delta_z > -((float)mode_threshold * 0.5f)) {
-                        current_mode = 0; // Terrain leveled out: Terminate glide, go flat
-                    }
+                else if (current_mode == 2) {
+                    if (delta_z > -((float)mode_threshold * 0.5f)) current_mode = 0;
                 }
-
-                // Assign the calculated mode to ALL steps inside this specific chunk
-                for (size_t s = i; s < end_idx; s++) {
-                    raw_modes[s] = current_mode;
-                }
-
-                // Carry the current group's average forward for the next derivative check
+                for (size_t s = i; s < end_idx; s++) raw_modes[s] = current_mode;
                 prev_group_elev = current_group_elev;
             }
 
@@ -688,7 +805,6 @@ namespace MapCanvas {
             for (int s = 1; s < (int)ui_steps.size(); s++) {
                 if (raw_modes[s] != raw_modes[s - 1]) {
                     int upcoming_mode = raw_modes[s];
-                    // Use the dynamic UI slider variable instead of hardcoded 3
                     for (int b = 1; b <= tile_offset; b++) {
                         if (s - b >= 0) final_modes[s - b] = upcoming_mode;
                     }
@@ -697,132 +813,375 @@ namespace MapCanvas {
 
             // --- Draw the Colored Tiles ---
             if (zoom > 15.0f) {
+                int last_drawn_x = -1;
+                int last_drawn_y = -1;
+
                 for (size_t s = 0; s < ui_steps.size(); s++) {
-                    ImU32 tile_color;
-                    if (final_modes[s] == 1)      tile_color = IM_COL32(255, 50, 50, 100);   // Red
-                    else if (final_modes[s] == 2) tile_color = IM_COL32(50, 150, 255, 100);  // Blue
-                    else                          tile_color = IM_COL32(50, 255, 50, 100);   // Green
+                    ImU32 tile_color = IM_COL32(50, 255, 50, 100);
+                    if (final_modes[s] == 1) tile_color = IM_COL32(255, 50, 50, 100);
+                    else if (final_modes[s] == 2) tile_color = IM_COL32(50, 150, 255, 100);
 
                     for (const auto& t : ui_steps[s].tiles) {
+                        // Deduplication: Prevent alpha-stacking on segment boundaries
+                        if (t.x == last_drawn_x && t.y == last_drawn_y) continue;
+
                         float screen_x = map_origin.x + t.x * zoom;
                         float screen_y = map_origin.y + t.y * zoom;
                         draw_list->AddRectFilled(ImVec2(screen_x, screen_y), ImVec2(screen_x + zoom, screen_y + zoom), tile_color);
+
+                        last_drawn_x = t.x;
+                        last_drawn_y = t.y;
                     }
                 }
             }
 
-            // --- Draw the Dynamic Multi-Colored Line ---
-            float start_cx = map_origin.x + (start_x + 0.5f) * zoom;
-            float start_cy = map_origin.y + (start_y + 0.5f) * zoom;
-            float end_cx = map_origin.x + (end_x + 0.5f) * zoom;
-            float end_cy = map_origin.y + (end_y + 0.5f) * zoom;
+            // --- 3. Draw the Exact Mathematical Line ---
+            for (size_t s = 0; s < ui_steps.size(); s++) {
+                ImU32 segment_color = IM_COL32(50, 255, 50, 255);
+                if (!final_modes.empty()) {
+                    if (final_modes[s] == 1) segment_color = IM_COL32(255, 50, 50, 255);
+                    else if (final_modes[s] == 2) segment_color = IM_COL32(50, 150, 255, 255);
+                }
 
-            for (size_t s = 0; s < ui_steps.size() - 1; s++) {
-                ImU32 line_color;
-                if (final_modes[s] == 1)      line_color = IM_COL32(255, 50, 50, 255);   // Solid Red
-                else if (final_modes[s] == 2) line_color = IM_COL32(50, 150, 255, 255);  // Solid Blue
-                else                          line_color = IM_COL32(50, 255, 50, 255);   // Solid Green
+                size_t p_idx = ui_steps[s].path_idx;
+                if (p_idx == 0 || p_idx >= flight_path.size()) continue;
 
-                // Interpolate exact points along the perfect center vector
-                float t1 = (float)s / (float)(ui_steps.size() - 1);
-                float t2 = (float)(s + 1) / (float)(ui_steps.size() - 1);
+                float fx1 = flight_path[p_idx - 1].x;
+                float fy1 = flight_path[p_idx - 1].y;
+                float fx2 = flight_path[p_idx].x;
+                float fy2 = flight_path[p_idx].y;
 
-                float x1 = start_cx + t1 * (end_cx - start_cx);
-                float y1 = start_cy + t1 * (end_cy - start_cy);
-                float x2 = start_cx + t2 * (end_cx - start_cx);
-                float y2 = start_cy + t2 * (end_cy - start_cy);
+                float ex1 = map_origin.x + (fx1 + ui_steps[s].t_start * (fx2 - fx1) + 0.5f) * zoom;
+                float ey1 = map_origin.y + (fy1 + ui_steps[s].t_start * (fy2 - fy1) + 0.5f) * zoom;
+                float ex2 = map_origin.x + (fx1 + ui_steps[s].t_end * (fx2 - fx1) + 0.5f) * zoom;
+                float ey2 = map_origin.y + (fy1 + ui_steps[s].t_end * (fy2 - fy1) + 0.5f) * zoom;
 
-                draw_list->AddLine(ImVec2(x1, y1), ImVec2(x2, y2), line_color, 3.0f);
+                draw_list->AddLine(ImVec2(ex1, ey1), ImVec2(ex2, ey2), segment_color, 3.0f);
             }
-
         }
         // ==========================================
         // PASS 2: DRAW WAYPOINT MARKERS (TOP LAYER)
         // ==========================================
-        for (size_t i = 0; i < waypoints.size(); i++) {
-
-            float center_x = map_origin.x + (waypoints[i].raw_x + 0.5f) * zoom;
-            float center_y = map_origin.y + (waypoints[i].raw_y + 0.5f) * zoom;
+        auto draw_marker = [&](float r_x, float r_y, const char* label, ImU32 color, bool is_center_dot) {
+            float center_x = map_origin.x + (r_x + 0.5f) * zoom;
+            float center_y = map_origin.y + (r_y + 0.5f) * zoom;
 
             if (center_x >= canvas_p0.x - 50 && center_x <= canvas_p1.x + 50 &&
                 center_y >= canvas_p0.y - 50 && center_y <= canvas_p1.y + 50) {
 
-                char wp_num[16];
-                snprintf(wp_num, sizeof(wp_num), "WP %zu", i + 1);
-
-                if (zoom > 15.0f) {
-                    float p0_x = map_origin.x + waypoints[i].raw_x * zoom;
-                    float p0_y = map_origin.y + waypoints[i].raw_y * zoom;
-
-                    draw_list->AddRectFilled(ImVec2(p0_x, p0_y), ImVec2(p0_x + zoom, p0_y + zoom), blinkingTileColor);
-                    draw_list->AddRect(ImVec2(p0_x, p0_y), ImVec2(p0_x + zoom, p0_y + zoom), markerColor, 0.0f, 0, 1.5f);
-
-                    ImVec2 text_sz = ImGui::CalcTextSize(wp_num);
-                    draw_list->AddText(ImVec2(center_x - text_sz.x * 0.5f, center_y - text_sz.y * 0.5f), outlineColor, wp_num);
+                if (zoom > 15.0f && !is_center_dot) {
+                    float p0_x = map_origin.x + r_x * zoom;
+                    float p0_y = map_origin.y + r_y * zoom;
+                    draw_list->AddRectFilled(ImVec2(p0_x, p0_y), ImVec2(p0_x + zoom, p0_y + zoom), color & 0x7FFFFFFF);
+                    draw_list->AddRect(ImVec2(p0_x, p0_y), ImVec2(p0_x + zoom, p0_y + zoom), color, 0.0f, 0, 1.5f);
                 }
                 else {
-                    draw_list->AddCircleFilled(ImVec2(center_x, center_y), 4.0f, markerColor);
-                    draw_list->AddCircle(ImVec2(center_x, center_y), 12.0f, outlineColor, 0, 1.5f);
-                    draw_list->AddLine(ImVec2(center_x - 20, center_y), ImVec2(center_x + 20, center_y), markerColor, 2.0f);
-                    draw_list->AddLine(ImVec2(center_x, center_y - 20), ImVec2(center_x, center_y + 20), markerColor, 2.0f);
-                    draw_list->AddText(ImVec2(center_x + 15, center_y - 25), outlineColor, wp_num);
+                    draw_list->AddCircleFilled(ImVec2(center_x, center_y), is_center_dot ? 3.0f : 4.0f, color);
+                    if (!is_center_dot) draw_list->AddCircle(ImVec2(center_x, center_y), 12.0f, outlineColor, 0, 1.5f);
+                    draw_list->AddLine(ImVec2(center_x - (is_center_dot ? 8 : 20), center_y), ImVec2(center_x + (is_center_dot ? 8 : 20), center_y), color, 2.0f);
+                    draw_list->AddLine(ImVec2(center_x, center_y - (is_center_dot ? 8 : 20)), ImVec2(center_x, center_y + (is_center_dot ? 8 : 20)), color, 2.0f);
                 }
+                ImVec2 text_sz = ImGui::CalcTextSize(label);
+                draw_list->AddText(ImVec2(center_x + 10, center_y - 20), outlineColor, label);
             }
+            };
+
+        int display_wp_idx = 1;
+        for (size_t i = 0; i < waypoints.size(); ) {
+            if (waypoints[i].type == WpType::Standard) {
+                draw_marker(waypoints[i].raw_x, waypoints[i].raw_y, ("WP " + std::to_string(display_wp_idx++)).c_str(), markerColor, false);
+                i++;
+            }
+            else if (waypoints[i].type == WpType::Arc3Pt && i + 2 < waypoints.size()) {
+                std::string pfx = "3C" + std::to_string(waypoints[i].group_id);
+                draw_marker(waypoints[i].raw_x, waypoints[i].raw_y, (pfx + "_Start").c_str(), markerColor, false);
+
+                bool is_flipped = (waypoints[i].center_angle > 0.5f);
+                if (!is_flipped) {
+                    draw_marker(waypoints[i + 1].raw_x, waypoints[i + 1].raw_y, (pfx + "_Mid").c_str(), markerColor, false);
+                }
+
+                draw_marker(waypoints[i + 2].raw_x, waypoints[i + 2].raw_y, (pfx + "_End").c_str(), markerColor, false);
+
+                double x1 = waypoints[i].raw_x, y1 = waypoints[i].raw_y;
+                double x2 = (double)waypoints[i + 1].raw_x - x1, y2 = (double)waypoints[i + 1].raw_y - y1;
+                double x3 = (double)waypoints[i + 2].raw_x - x1, y3 = (double)waypoints[i + 2].raw_y - y1;
+                double D = 2.0 * (x2 * y3 - x3 * y2);
+                if (std::abs(D) > 0.1) {
+                    double Xc = x1 + ((x2 * x2 + y2 * y2) * y3 - (x3 * x3 + y3 * y3) * y2) / D;
+                    double Yc = y1 + ((x3 * x3 + y3 * y3) * x2 - (x2 * x2 + y2 * y2) * x3) / D;
+                    draw_marker((float)Xc, (float)Yc, (pfx + "_Center").c_str(), IM_COL32(255, 165, 0, 255), true);
+                }
+                i += 3;
+            }
+            else if (waypoints[i].type == WpType::ArcCenterAnchor && i + 1 < waypoints.size()) {
+                std::string pfx = "C" + std::to_string(waypoints[i].group_id);
+                draw_marker(waypoints[i].raw_x, waypoints[i].raw_y, (pfx + "_Start").c_str(), markerColor, false);
+                draw_marker(waypoints[i + 1].raw_x, waypoints[i + 1].raw_y, (pfx + "_Center").c_str(), IM_COL32(255, 165, 0, 255), true);
+
+                double sx = waypoints[i].raw_x, sy = waypoints[i].raw_y;
+                double cx = waypoints[i + 1].raw_x, cy = waypoints[i + 1].raw_y;
+                double dx = sx - cx, dy = sy - cy;
+                double R = std::sqrt(dx * dx + dy * dy);
+                double end_angle = std::atan2(dy, dx) + (waypoints[i + 1].center_angle * (3.1415926535 / 180.0));
+                draw_marker((float)(cx + R * std::cos(end_angle)), (float)(cy + R * std::sin(end_angle)), (pfx + "_End").c_str(), markerColor, false);
+
+                i += 2;
+            }
+            else { i++; }
+        }
+
+        for (size_t i = 0; i < temp_arc_points.size(); i++) {
+            draw_marker(temp_arc_points[i].raw_x, temp_arc_points[i].raw_y, "Pending", IM_COL32(255, 165, 0, 255), false);
         }
         draw_list->PopClipRect();
     }
 
     void RenderControlPanelUI() {
         ImGui::Separator();
+        ImGui::Text("Flight Geometry:");
+
+        if (current_state != AppState::IDLE) {
+            if (ImGui::Button("Cancel to Line")) {
+                current_state = AppState::IDLE;
+                temp_arc_points.clear();
+            }
+            ImGui::SameLine();
+            ImGui::BeginDisabled();
+            ImGui::Button("3-Point Arc");
+            ImGui::SameLine();
+            ImGui::Button("Center Arc");
+            ImGui::EndDisabled();
+
+            if (current_state == AppState::ADJUSTING_CENTER_ARC && temp_arc_points.size() == 2) {
+                ImGui::Separator();
+                ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "Adjusting Center Arc Angle:");
+
+                // Live Slider & Input Box (Supports Multi-Turn 750°+)
+                ImGui::SliderFloat("##sweep_slider", &temp_arc_points[1].center_angle, -1080.0f, 1080.0f, "%.1f deg");
+                ImGui::InputFloat("##sweep_input", &temp_arc_points[1].center_angle, 1.0f, 15.0f, "%.1f");
+
+                if (ImGui::Button("Commit Arc", ImVec2(120, 0))) {
+                    for (const auto& p : temp_arc_points) waypoints.push_back(p);
+                    current_arc_group++;
+                    temp_arc_points.clear();
+                    current_state = AppState::IDLE;
+                    SaveSession();
+                }
+            }
+            else {
+                ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.0f, 1.0f),
+                    current_state <= AppState::WAITING_3PT_3 ? "Waiting for 3-Point Arc selection..." : "Waiting for Center Arc selection...");
+            }
+        }
+        else {
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.5f, 0.8f, 1.0f));
+            ImGui::Button("Straight Line");
+            ImGui::PopStyleColor();
+            ImGui::SameLine();
+            if (ImGui::Button("3-Point Arc")) {
+                current_state = AppState::WAITING_3PT_1;
+                temp_arc_points.clear();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Center Arc")) {
+                current_state = AppState::WAITING_CENTER_1;
+                temp_arc_points.clear();
+            }
+        }
+
+        ImGui::Separator();
         ImGui::Text("Mission Generation:");
 
-        // Trigger SaveSession() whenever a slider is changed
-        if (ImGui::SliderInt("Mode Threshold (m)", &mode_threshold, 5, 100, "%d m")) SaveSession();
+        if (ImGui::SliderInt("Mode Threshold", &mode_threshold, 5, 100, "%d m")) SaveSession();
         if (ImGui::SliderInt("Tile Offset", &tile_offset, 0, 20, "%d tiles")) SaveSession();
         if (ImGui::SliderInt("Step Grouping", &step_grouping, 1, 20, "%d steps")) SaveSession();
 
-        // Safety Lock: Only activate if a path exists AND the async texture loader is finished
+        ImGui::Separator();
         if (waypoints.size() >= 2 && map_loaded.load()) {
-            if (ImGui::Button("Export F-Code Mission")) {
+            if (ImGui::Button("Export F-Code")) {
                 ExportMissionFCode();
             }
         }
         else {
             ImGui::BeginDisabled();
-            ImGui::Button("Export F-Code Mission");
+            ImGui::Button("Export F-Code");
             ImGui::EndDisabled();
-
-            // Add a visual indicator if the button is disabled due to loading
             if (!map_loaded.load()) {
                 ImGui::SameLine();
                 ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.0f, 1.0f), " (Parsing Terrain...)");
             }
         }
 
-        ImGui::Spacing();
-        ImGui::Text("Selected Waypoints:");
+        if (!waypoints.empty()) {
+            ImGui::Separator();
+            ImGui::Text("Selected Waypoints:");
 
-        // Create a scrollable list box for the waypoints
-        if (ImGui::BeginChild("WPList", ImVec2(0, 150), true, ImGuiWindowFlags_HorizontalScrollbar)) {
-            for (size_t i = 0; i < waypoints.size(); i++) {
-                int lon = (26 * 3600) + (int)waypoints[i].raw_x;
-                int lat = (42 * 3600) - (int)waypoints[i].raw_y;
+            if (ImGui::BeginChild("WPList", ImVec2(0, 150), true, ImGuiWindowFlags_HorizontalScrollbar)) {
+                int display_wp_idx = 1;
+                for (size_t i = 0; i < waypoints.size(); ) {
+                    int lon = (26 * 3600) + (int)waypoints[i].raw_x;
+                    int lat = (42 * 3600) - (int)waypoints[i].raw_y;
+                    float elev = (elevation_data != nullptr) ? elevation_data[(size_t)waypoints[i].raw_y * 68400 + (size_t)waypoints[i].raw_x] : 0.0f;
 
-                float elev = 0.0f;
-                if (elevation_data != nullptr) {
-                    elev = elevation_data[(size_t)waypoints[i].raw_y * 68400 + (size_t)waypoints[i].raw_x];
+                    if (waypoints[i].type == WpType::Arc3Pt) {
+                        double x1 = waypoints[i].raw_x, y1 = waypoints[i].raw_y;
+                        double x2 = (double)waypoints[i + 1].raw_x - x1, y2 = (double)waypoints[i + 1].raw_y - y1;
+                        double x3 = (double)waypoints[i + 2].raw_x - x1, y3 = (double)waypoints[i + 2].raw_y - y1;
+                        double D = 2.0 * (x2 * y3 - x3 * y2);
+                        double display_angle = 0.0;
+                        if (std::abs(D) > 0.1) {
+                            double Xc = ((x2 * x2 + y2 * y2) * y3 - (x3 * x3 + y3 * y3) * y2) / D;
+                            double Yc = ((x3 * x3 + y3 * y3) * x2 - (x2 * x2 + y2 * y2) * x3) / D;
+                            double start_angle = std::atan2(-Yc, -Xc);
+                            double mid_angle = std::atan2(y2 - Yc, x2 - Xc);
+                            double end_angle = std::atan2(y3 - Yc, x3 - Xc);
+                            double angle_diff = end_angle - start_angle;
+                            while (angle_diff <= -3.14159265) angle_diff += 6.2831853;
+                            while (angle_diff > 3.14159265) angle_diff -= 6.2831853;
+                            double mid_diff = mid_angle - start_angle;
+                            while (mid_diff <= -3.14159265) mid_diff += 6.2831853;
+                            while (mid_diff > 3.14159265) mid_diff -= 6.2831853;
+                            bool missed_opposite = ((angle_diff > 0.0 && mid_diff < 0.0) || (angle_diff < 0.0 && mid_diff > 0.0));
+                            bool missed_overshoot = ((angle_diff > 0.0 && mid_diff > 0.0 && mid_diff > angle_diff) ||
+                                (angle_diff < 0.0 && mid_diff < 0.0 && mid_diff < angle_diff));
+                            if (missed_opposite || missed_overshoot) angle_diff += (angle_diff > 0.0) ? -6.2831853072 : 6.2831853072;
+                            if (waypoints[i].center_angle > 0.5f) angle_diff += (angle_diff > 0.0) ? -6.2831853072 : 6.2831853072;
+                            display_angle = angle_diff * (180.0 / 3.1415926535);
+                        }
+
+                        ImGui::Text("3P-Arc (3C%d): %d\xC2\xB0%02d'%02d\"N  %d\xC2\xB0%02d'%02d\"E | %.1f\xC2\xB0",
+                            waypoints[i].group_id, lat / 3600, (lat % 3600) / 60, lat % 60, lon / 3600, (lon % 3600) / 60, lon % 60, display_angle);
+                        i += 3;
+                    }
+                    else if (waypoints[i].type == WpType::ArcCenterAnchor) {
+                        ImGui::Text("Cent-Arc (C%d): %d\xC2\xB0%02d'%02d\"N  %d\xC2\xB0%02d'%02d\"E | %.1f\xC2\xB0",
+                            waypoints[i].group_id, lat / 3600, (lat % 3600) / 60, lat % 60, lon / 3600, (lon % 3600) / 60, lon % 60, waypoints[i + 1].center_angle);
+                        i += 2;
+                    }
+                    else {
+                        ImGui::Text("WP %d:         %d\xC2\xB0%02d'%02d\"N  %d\xC2\xB0%02d'%02d\"E  |  %.1fm",
+                            display_wp_idx++, lat / 3600, (lat % 3600) / 60, lat % 60, lon / 3600, (lon % 3600) / 60, lon % 60, elev);
+                        i++;
+                    }
                 }
-
-                // Format: WP 1: 41°08'44"N 33°35'21"E | 942.2m
-                ImGui::Text("WP %zu:  %d\xC2\xB0%02d'%02d\"N  %d\xC2\xB0%02d'%02d\"E  |  %.1fm",
-                    i + 1,
-                    lat / 3600, (lat % 3600) / 60, lat % 60,
-                    lon / 3600, (lon % 3600) / 60, lon % 60,
-                    elev);
             }
-        }
-        ImGui::EndChild();
+            ImGui::EndChild();
 
+            ImGui::Spacing();
+            float total_distance = 0.0f;
+            float last_x = waypoints[0].raw_x;
+            float last_y = waypoints[0].raw_y;
+
+            for (size_t i = 0; i < waypoints.size(); ) {
+                if (waypoints[i].type == WpType::Standard) {
+                    if (i > 0) {
+                        float dist = std::sqrt(std::pow(waypoints[i].raw_x - last_x, 2) + std::pow(waypoints[i].raw_y - last_y, 2)) * 30.0f;
+                        ImGui::Text("Line: %.1f m", dist);
+                        total_distance += dist;
+                    }
+                    last_x = waypoints[i].raw_x;
+                    last_y = waypoints[i].raw_y;
+                    i++;
+                }
+                else if (waypoints[i].type == WpType::Arc3Pt && i + 2 < waypoints.size()) {
+                    // 3P-Arc Straight Line Bridge Restored
+                    if (i > 0) {
+                        float dist = std::sqrt(std::pow(waypoints[i].raw_x - last_x, 2) + std::pow(waypoints[i].raw_y - last_y, 2)) * 30.0f;
+                        if (dist > 0.1f) {
+                            ImGui::Text("Line: %.1f m", dist);
+                            total_distance += dist;
+                        }
+                    }
+
+                    double x1 = waypoints[i].raw_x, y1 = waypoints[i].raw_y;
+                    double x2 = (double)waypoints[i + 1].raw_x - x1, y2 = (double)waypoints[i + 1].raw_y - y1;
+                    double x3 = (double)waypoints[i + 2].raw_x - x1, y3 = (double)waypoints[i + 2].raw_y - y1;
+                    double D = 2.0 * (x2 * y3 - x3 * y2);
+                    float arc_len = 0.0f;
+
+                    if (std::abs(D) > 0.1) {
+                        double Xc = ((x2 * x2 + y2 * y2) * y3 - (x3 * x3 + y3 * y3) * y2) / D;
+                        double Yc = ((x3 * x3 + y3 * y3) * x2 - (x2 * x2 + y2 * y2) * x3) / D;
+                        double R = std::sqrt(Xc * Xc + Yc * Yc);
+                        double start_angle = std::atan2(-Yc, -Xc);
+                        double mid_angle = std::atan2(y2 - Yc, x2 - Xc);
+                        double end_angle = std::atan2(y3 - Yc, x3 - Xc);
+                        double angle_diff = end_angle - start_angle;
+
+                        while (angle_diff <= -3.14159265) angle_diff += 6.2831853;
+                        while (angle_diff > 3.14159265) angle_diff -= 6.2831853;
+                        double mid_diff = mid_angle - start_angle;
+                        while (mid_diff <= -3.14159265) mid_diff += 6.2831853;
+                        while (mid_diff > 3.14159265) mid_diff -= 6.2831853;
+
+                        bool missed_opposite = ((angle_diff > 0.0 && mid_diff < 0.0) || (angle_diff < 0.0 && mid_diff > 0.0));
+                        bool missed_overshoot = ((angle_diff > 0.0 && mid_diff > 0.0 && mid_diff > angle_diff) ||
+                            (angle_diff < 0.0 && mid_diff < 0.0 && mid_diff < angle_diff));
+                        if (missed_opposite || missed_overshoot) angle_diff += (angle_diff > 0.0) ? -6.2831853072 : 6.2831853072;
+                        if (waypoints[i].center_angle > 0.5f) angle_diff += (angle_diff > 0.0) ? -6.2831853072 : 6.2831853072;
+
+                        arc_len = (float)(R * std::abs(angle_diff)) * 30.0f;
+                    }
+
+                    ImGui::Text("3P-Arc (3C%d): %.1f m", waypoints[i].group_id, arc_len);
+
+                    ImGui::SameLine(ImGui::GetWindowWidth() - 60.0f);
+                    ImGui::PushID((int)i);
+                    if (ImGui::Button("Flip")) {
+                        waypoints[i].center_angle = (waypoints[i].center_angle > 0.5f) ? 0.0f : 1.0f;
+                        SaveSession();
+                    }
+                    ImGui::PopID();
+
+                    total_distance += arc_len;
+                    last_x = waypoints[i + 2].raw_x;
+                    last_y = waypoints[i + 2].raw_y;
+                    i += 3;
+                }
+                else if (waypoints[i].type == WpType::ArcCenterAnchor && i + 1 < waypoints.size()) {
+                    // Center Arc Straight Line Bridge
+                    if (i > 0) {
+                        float dist = std::sqrt(std::pow(waypoints[i].raw_x - last_x, 2) + std::pow(waypoints[i].raw_y - last_y, 2)) * 30.0f;
+                        if (dist > 0.1f) {
+                            ImGui::Text("Line: %.1f m", dist);
+                            total_distance += dist;
+                        }
+                    }
+                    double sx = waypoints[i].raw_x, sy = waypoints[i].raw_y;
+                    double cx = waypoints[i + 1].raw_x, cy = waypoints[i + 1].raw_y;
+                    double dx = sx - cx, dy = sy - cy;
+                    double R = std::sqrt(dx * dx + dy * dy);
+                    double sweep_rads = waypoints[i + 1].center_angle * (3.1415926535 / 180.0);
+
+                    float arc_len = (float)(R * std::abs(sweep_rads)) * 30.0f;
+                    ImGui::Text("Cent-Arc (C%d): %.1f m", waypoints[i].group_id, arc_len);
+
+                    ImGui::SameLine(ImGui::GetWindowWidth() - 60.0f);
+                    ImGui::PushID((int)i);
+                    if (ImGui::Button("Flip")) {
+                        waypoints[i + 1].center_angle = -waypoints[i + 1].center_angle;
+                        SaveSession();
+                    }
+                    ImGui::PopID();
+
+                    total_distance += arc_len;
+
+                    double start_angle = std::atan2(dy, dx);
+                    double end_angle = start_angle + sweep_rads;
+                    last_x = (float)(cx + R * std::cos(end_angle));
+                    last_y = (float)(cy + R * std::sin(end_angle));
+                    i += 2;
+                }
+                else { i++; }
+            }
+            ImGui::Separator();
+            ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "Total Distance: %.1f m", total_distance);
+        }
+        else {
+            ImGui::Separator();
+            ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "No waypoints deployed.");
+        }
         ImGui::Spacing();
     }
 
@@ -861,8 +1220,104 @@ namespace MapCanvas {
         file.close();
     }
 
+    std::vector<ImVec2> GenerateFlightPath() {
+        std::vector<ImVec2> path;
+
+        // Combine locked points and the live pending points for real-time rendering
+        std::vector<Waypoint> all_wps = waypoints;
+        all_wps.insert(all_wps.end(), temp_arc_points.begin(), temp_arc_points.end());
+
+        if (all_wps.empty()) return path;
+
+        for (size_t i = 0; i < all_wps.size(); ) {
+            if (all_wps[i].type == WpType::Arc3Pt) {
+                if (i + 2 < all_wps.size() && all_wps[i + 1].type == WpType::Arc3Pt && all_wps[i + 2].type == WpType::Arc3Pt) {
+                    double x1 = 0.0, y1 = 0.0;
+                    double x2 = (double)all_wps[i + 1].raw_x - (double)all_wps[i].raw_x;
+                    double y2 = (double)all_wps[i + 1].raw_y - (double)all_wps[i].raw_y;
+                    double x3 = (double)all_wps[i + 2].raw_x - (double)all_wps[i].raw_x;
+                    double y3 = (double)all_wps[i + 2].raw_y - (double)all_wps[i].raw_y;
+                    double D_double = 2.0 * (x2 * y3 - x3 * y2);
+
+                    if (std::abs(D_double) < 0.1) {
+                        path.push_back(ImVec2(all_wps[i].raw_x, all_wps[i].raw_y));
+                        path.push_back(ImVec2(all_wps[i + 1].raw_x, all_wps[i + 1].raw_y));
+                        path.push_back(ImVec2(all_wps[i + 2].raw_x, all_wps[i + 2].raw_y));
+                    }
+                    else {
+                        double Xc_rel = ((x2 * x2 + y2 * y2) * y3 - (x3 * x3 + y3 * y3) * y2) / D_double;
+                        double Yc_rel = ((x3 * x3 + y3 * y3) * x2 - (x2 * x2 + y2 * y2) * x3) / D_double;
+                        double Xc = (double)all_wps[i].raw_x + Xc_rel;
+                        double Yc = (double)all_wps[i].raw_y + Yc_rel;
+                        double R = std::sqrt(Xc_rel * Xc_rel + Yc_rel * Yc_rel);
+
+                        double start_angle = std::atan2((double)all_wps[i].raw_y - Yc, (double)all_wps[i].raw_x - Xc);
+                        double mid_angle = std::atan2((double)all_wps[i + 1].raw_y - Yc, (double)all_wps[i + 1].raw_x - Xc);
+                        double end_angle = std::atan2((double)all_wps[i + 2].raw_y - Yc, (double)all_wps[i + 2].raw_x - Xc);
+
+                        double angle_diff = end_angle - start_angle;
+                        while (angle_diff <= -3.1415926535) angle_diff += 6.2831853072;
+                        while (angle_diff > 3.1415926535)  angle_diff -= 6.2831853072;
+
+                        double mid_diff = mid_angle - start_angle;
+                        while (mid_diff <= -3.1415926535) mid_diff += 6.2831853072;
+                        while (mid_diff > 3.1415926535)  mid_diff -= 6.2831853072;
+
+                        bool missed_opposite = ((angle_diff > 0.0 && mid_diff < 0.0) || (angle_diff < 0.0 && mid_diff > 0.0));
+                        bool missed_overshoot = ((angle_diff > 0.0 && mid_diff > 0.0 && mid_diff > angle_diff) ||
+                            (angle_diff < 0.0 && mid_diff < 0.0 && mid_diff < angle_diff));
+
+                        if (missed_opposite || missed_overshoot) angle_diff += (angle_diff > 0.0) ? -6.2831853072 : 6.2831853072;
+                        if (all_wps[i].center_angle > 0.5f) angle_diff += (angle_diff > 0.0) ? -6.2831853072 : 6.2831853072;
+
+                        int segments = (int)(std::max)(10.0, std::abs(angle_diff) * 30.0);
+                        for (int j = 0; j <= segments; j++) {
+                            double t = (double)j / (double)segments;
+                            double current_angle = start_angle + (angle_diff * t);
+                            path.push_back(ImVec2((float)(Xc + R * std::cos(current_angle)), (float)(Yc + R * std::sin(current_angle))));
+                        }
+                    }
+                    i += 3;
+                    continue;
+                }
+            }
+            else if (all_wps[i].type == WpType::ArcCenterAnchor) {
+                if (i + 1 < all_wps.size() && all_wps[i + 1].type == WpType::ArcCenterEnd) {
+                    double sx = (double)all_wps[i].raw_x;
+                    double sy = (double)all_wps[i].raw_y;
+                    double cx = (double)all_wps[i + 1].raw_x;
+                    double cy = (double)all_wps[i + 1].raw_y;
+                    double dx = sx - cx;
+                    double dy = sy - cy;
+                    double R = std::sqrt(dx * dx + dy * dy);
+
+                    double start_angle = std::atan2(dy, dx);
+                    // Live parametric angle tracking, supporting > 360 degree multi-turns
+                    double sweep_angle = all_wps[i + 1].center_angle * (3.1415926535 / 180.0);
+
+                    int segments = (int)(std::max)(10.0, std::abs(sweep_angle) * 30.0);
+                    for (int j = 0; j <= segments; j++) {
+                        double t = (double)j / (double)segments;
+                        double current_angle = start_angle + (sweep_angle * t);
+                        path.push_back(ImVec2((float)(cx + R * std::cos(current_angle)), (float)(cy + R * std::sin(current_angle))));
+                    }
+                    i += 2;
+                    continue;
+                }
+            }
+
+            path.push_back(ImVec2(all_wps[i].raw_x, all_wps[i].raw_y));
+            i++;
+        }
+        return path;
+    }
+
     void ExportMissionFCode() {
         if (waypoints.size() < 2) return;
+
+        // 1. Generate the true mathematical curve (Lines + Arcs)
+        std::vector<ImVec2> flight_path = GenerateFlightPath();
+        if (flight_path.size() < 2) return;
 
         // Format: DDMMSSNDDMMSSE-DDMMSSNDDMMSSE-A.txt
         auto format_wp = [](const Waypoint& wp) {
@@ -893,181 +1348,158 @@ namespace MapCanvas {
         ofn.Flags = OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT;
 
         if (GetSaveFileNameA(&ofn) == TRUE) {
-            std::ofstream file(ofn.lpstrFile); // Use the selected directory!
+            std::ofstream file(ofn.lpstrFile);
             if (!file.is_open()) return;
 
-        file << "%\n";
-        file << "F43; Z50;\n";
-        
-        for (size_t i = 1; i < waypoints.size(); i++) {
+            file << "%\n";
+            file << "F43; Z50;\n";
 
-            int start_x = (int)waypoints[i - 1].raw_x;
-            int start_y = (int)waypoints[i - 1].raw_y;
-            int end_x = (int)waypoints[i].raw_x;
-            int end_y = (int)waypoints[i].raw_y;
-
-            int dx = end_x - start_x;
-            int dy = end_y - start_y;
-            int step_x = (dx > 0) ? 1 : ((dx < 0) ? -1 : 0);
-            int step_y = (dy > 0) ? 1 : ((dy < 0) ? -1 : 0);
-
-            bool is_x_parent = abs(dx) >= abs(dy);
-
-            double abs_dx = fabs((double)dx);
-            double abs_dy = fabs((double)dy);
-            double tDeltaX = (abs_dx == 0) ? 1e30 : 1.0 / abs_dx;
-            double tDeltaY = (abs_dy == 0) ? 1e30 : 1.0 / abs_dy;
-            double tMaxX = (abs_dx == 0) ? 1e30 : 0.5 / abs_dx;
-            double tMaxY = (abs_dy == 0) ? 1e30 : 0.5 / abs_dy;
-
-            int current_x = start_x;
-            int current_y = start_y;
-            int total_crossings = (int)(abs_dx + abs_dy);
-
-            // --- PARENT AXIS GROUPING LOGIC ---
-            struct FlightStep {
-                int map_x, map_y;
+            // --- 2. Global Supercover Raycast (Synchronized to Renderer) ---
+            struct UITile { int x, y; };
+            struct UIFlightStep {
+                std::vector<UITile> tiles;
                 float sum_elev;
                 int tile_count;
             };
-            std::vector<FlightStep> steps;
+            std::vector<UIFlightStep> steps;
 
-            FlightStep current_step = { current_x, current_y, 0.0f, 0 };
-            int prev_parent = is_x_parent ? current_x : current_y;
+            UIFlightStep current_step;
+            current_step.sum_elev = 0.0f;
+            current_step.tile_count = 0;
+            int prev_parent = -1;
 
-            // Lambda to handle 1-tile or 2-tile grouping dynamically
-            auto add_tile_to_step = [&](int cx, int cy) {
+            auto add_tile_to_step = [&](int cx, int cy, bool is_x_parent) {
                 int current_parent = is_x_parent ? cx : cy;
+                if (prev_parent == -1) prev_parent = current_parent;
                 if (current_parent != prev_parent) {
-                    steps.push_back(current_step);
-                    current_step = { cx, cy, 0.0f, 0 };
+                    if (current_step.tile_count > 0) steps.push_back(current_step);
+                    current_step = UIFlightStep();
+                    current_step.sum_elev = 0.0f;
+                    current_step.tile_count = 0;
                     prev_parent = current_parent;
                 }
-
-                float elev = 0.0f;
-                if (elevation_data != nullptr) {
-                    elev = elevation_data[(size_t)cy * 68400 + (size_t)cx]; //[cite: 2]
-                }
+                float elev = (elevation_data != nullptr) ? elevation_data[(size_t)cy * 68400 + (size_t)cx] : 0.0f;
                 current_step.sum_elev += elev;
                 current_step.tile_count++;
+                current_step.tiles.push_back({ cx, cy });
                 };
 
-            // Add starting tile
-            add_tile_to_step(current_x, current_y);
+            for (size_t i = 1; i < flight_path.size(); i++) {
+                int start_x = (int)flight_path[i - 1].x;
+                int start_y = (int)flight_path[i - 1].y;
+                int end_x = (int)flight_path[i].x;
+                int end_y = (int)flight_path[i].y;
 
-            // Supercover Raycast
-            for (int step = 0; step < total_crossings; step++) {
-                if (current_x == end_x && current_y == end_y) break;
+                if (start_x == end_x && start_y == end_y) {
+                    add_tile_to_step(start_x, start_y, true);
+                    continue;
+                }
 
-                if (fabs(tMaxX - tMaxY) < 1e-8) {
-                    current_x += step_x;
-                    current_y += step_y;
-                    tMaxX += tDeltaX;
-                    tMaxY += tDeltaY;
-                    step++;
-                    add_tile_to_step(current_x, current_y);
-                }
-                else if (tMaxX < tMaxY) {
-                    current_x += step_x;
-                    tMaxX += tDeltaX;
-                    add_tile_to_step(current_x, current_y);
-                }
-                else {
-                    current_y += step_y;
-                    tMaxY += tDeltaY;
-                    add_tile_to_step(current_x, current_y);
+                int dx = end_x - start_x;
+                int dy = end_y - start_y;
+                int step_x = (dx > 0) ? 1 : ((dx < 0) ? -1 : 0);
+                int step_y = (dy > 0) ? 1 : ((dy < 0) ? -1 : 0);
+                bool is_x_parent = std::abs(dx) >= std::abs(dy);
+
+                double abs_dx = std::abs((double)dx), abs_dy = std::abs((double)dy);
+                double tDeltaX = (abs_dx == 0) ? 1e30 : 1.0 / abs_dx;
+                double tDeltaY = (abs_dy == 0) ? 1e30 : 1.0 / abs_dy;
+                double tMaxX = (abs_dx == 0) ? 1e30 : 0.5 / abs_dx;
+                double tMaxY = (abs_dy == 0) ? 1e30 : 0.5 / abs_dy;
+
+                int current_x = start_x, current_y = start_y;
+                int total_crossings = (int)(abs_dx + abs_dy);
+
+                if (i == 1) add_tile_to_step(current_x, current_y, is_x_parent);
+
+                for (int step = 0; step < total_crossings; step++) {
+                    if (current_x == end_x && current_y == end_y) break;
+                    if (std::abs(tMaxX - tMaxY) < 1e-8) {
+                        current_x += step_x; current_y += step_y;
+                        tMaxX += tDeltaX; tMaxY += tDeltaY;
+                        step++; add_tile_to_step(current_x, current_y, is_x_parent);
+                    }
+                    else if (tMaxX < tMaxY) {
+                        current_x += step_x; tMaxX += tDeltaX; add_tile_to_step(current_x, current_y, is_x_parent);
+                    }
+                    else {
+                        current_y += step_y; tMaxY += tDeltaY; add_tile_to_step(current_x, current_y, is_x_parent);
+                    }
                 }
             }
-            steps.push_back(current_step); // Push the final grouped step
+            if (current_step.tile_count > 0) steps.push_back(current_step);
 
-            // --- 1. Mode Calculation (Grouped Step Strict Derivative) ---
+            // --- 3. Mode Calculation ---
             std::vector<int> raw_modes(steps.size(), 0);
             int current_mode = 0;
             float prev_group_elev = 0.0f;
-
-            // Iterate through the path in chunks defined by the slider
             for (size_t i = 0; i < steps.size(); i += step_grouping) {
-
                 float group_sum_elev = 0.0f;
                 int group_tile_count = 0;
-
-                // Prevent array out-of-bounds on the final chunk
                 size_t end_idx = (i + step_grouping < steps.size()) ? i + step_grouping : steps.size();
-
-                // Aggregate elevations and actual tile counts for the entire group
                 for (size_t s = i; s < end_idx; s++) {
                     group_sum_elev += steps[s].sum_elev;
                     group_tile_count += steps[s].tile_count;
                 }
-
-                // Average with respect to TOTAL TILE COUNT of the group
                 float current_group_elev = group_sum_elev / (float)group_tile_count;
-
-                // Initialize the previous elevation on the very first group
-                if (i == 0) {
-                    prev_group_elev = current_group_elev;
-                }
-
+                if (i == 0) prev_group_elev = current_group_elev;
                 float delta_z = current_group_elev - prev_group_elev;
 
-                // Apply your strict entry and half-threshold exit rules
-                if (current_mode == 0) { // Flat
-                    if (delta_z > (float)mode_threshold) {
-                        current_mode = 1; // Start Climb
-                    }
-                    else if (delta_z < -(float)mode_threshold) {
-                        current_mode = 2; // Start Glide
-                    }
+                if (current_mode == 0) {
+                    if (delta_z > (float)mode_threshold) current_mode = 1;
+                    else if (delta_z < -(float)mode_threshold) current_mode = 2;
                 }
-                else if (current_mode == 1) { // Climb
-                    if (delta_z < ((float)mode_threshold * 0.5f)) {
-                        current_mode = 0; // Terrain slacked off: Terminate climb, go flat
-                    }
+                else if (current_mode == 1) {
+                    if (delta_z < ((float)mode_threshold * 0.5f)) current_mode = 0;
                 }
-                else if (current_mode == 2) { // Glide
-                    if (delta_z > -((float)mode_threshold * 0.5f)) {
-                        current_mode = 0; // Terrain leveled out: Terminate glide, go flat
-                    }
+                else if (current_mode == 2) {
+                    if (delta_z > -((float)mode_threshold * 0.5f)) current_mode = 0;
                 }
-
-                // Assign the calculated mode to ALL steps inside this specific chunk
-                for (size_t s = i; s < end_idx; s++) {
-                    raw_modes[s] = current_mode;
-                }
-
-                // Carry the current group's average forward for the next derivative check
+                for (size_t s = i; s < end_idx; s++) raw_modes[s] = current_mode;
                 prev_group_elev = current_group_elev;
             }
 
-            // --- 2. Dynamic Feed-Forward Offset ---
+            // --- 4. Dynamic Feed-Forward Offset ---
             std::vector<int> final_modes = raw_modes;
             for (int s = 1; s < (int)steps.size(); s++) {
                 if (raw_modes[s] != raw_modes[s - 1]) {
                     int upcoming_mode = raw_modes[s];
-                    // Use the dynamic UI slider variable instead of hardcoded 3
                     for (int b = 1; b <= tile_offset; b++) {
                         if (s - b >= 0) final_modes[s - b] = upcoming_mode;
                     }
                 }
             }
 
-            // --- 3. F-CODE STRING GENERATION
-            current_mode = -1;
+            // --- 5. Flatten, Deduplicate, and Write F-CODE ---
+            struct FlatTile { int x, y, mode; };
+            std::vector<FlatTile> flat_tiles;
+            int last_x = -1, last_y = -1;
+
             for (size_t s = 0; s < steps.size(); s++) {
+                int mode = final_modes[s];
+                for (const auto& t : steps[s].tiles) {
+                    // Stripping overlap guarantees perfect sequential waypoints
+                    if (t.x == last_x && t.y == last_y) continue;
+                    flat_tiles.push_back({ t.x, t.y, mode });
+                    last_x = t.x;
+                    last_y = t.y;
+                }
+            }
 
-                int next_mode = final_modes[s];
-
-                int total_lon_sec = (26 * 3600) + steps[s].map_x;
-                int total_lat_sec = (42 * 3600) - steps[s].map_y;
+            current_mode = -1;
+            for (size_t f = 0; f < flat_tiles.size(); f++) {
+                int next_mode = flat_tiles[f].mode;
+                int total_lon_sec = (26 * 3600) + flat_tiles[f].x;
+                int total_lat_sec = (42 * 3600) - flat_tiles[f].y;
                 int lon_d = total_lon_sec / 3600, lon_m = (total_lon_sec % 3600) / 60, lon_s = total_lon_sec % 60;
                 int lat_d = total_lat_sec / 3600, lat_m = (total_lat_sec % 3600) / 60, lat_s = total_lat_sec % 60;
 
                 char line[128];
-                if (i == 1 && s == 0) {
+                if (f == 0) {
                     snprintf(line, sizeof(line), "F91; X%02d%02d%02d; Y%02d%02d%02d; N40;\n", lon_d, lon_m, lon_s, lat_d, lat_m, lat_s);
                     current_mode = next_mode;
                 }
-                else if (i == waypoints.size() - 1 && s == steps.size() - 1) {
+                else if (f == flat_tiles.size() - 1) {
                     snprintf(line, sizeof(line), "F91; X%02d%02d%02d; Y%02d%02d%02d; N39;\n", lon_d, lon_m, lon_s, lat_d, lat_m, lat_s);
                 }
                 else {
@@ -1081,11 +1513,9 @@ namespace MapCanvas {
                 }
                 file << line;
             }
+
+            file << "%\n";
+            file.close();
         }
-
-        file << "%\n";
-        file.close();
-    }
-
     }
 }

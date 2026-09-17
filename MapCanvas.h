@@ -4,11 +4,17 @@
 
 namespace MapCanvas {
 
+    enum class WpType { Standard, Arc3Pt, ArcCenterAnchor, ArcCenterEnd };
+
     struct Waypoint {
-        float raw_x;
-        float raw_y;
-        int lon_sec;
-        int lat_sec;
+        float raw_x, raw_y;
+        int lon_sec, lat_sec;
+
+        // Metadata for the State Machine
+        WpType type = WpType::Standard;
+        int group_id = -1;       // E.g., '1' for the first arc created (3C1)
+        int group_index = 0;     // 1, 2, or 3 for the sequence
+        float center_angle = 0.0f; // For multi-turn loitering (e.g., 720.0f)
     };
 
     extern bool show_minute_grid;
@@ -22,5 +28,6 @@ namespace MapCanvas {
     void RenderControlPanelUI();
     void SaveSession();
     void LoadSession();
+    std::vector<ImVec2> GenerateFlightPath();
 
 }
