@@ -1,17 +1,16 @@
-# Visual Studio Cache and Build Folders
-.vs/
-Debug/
-Release/
+# Build results
+[Dd]ebug/
+[Rr]elease/
 x64/
-*.user
-*.aps
-
-# Massive Data Assets
-terrain_data.bin
+x86/
+[Bb]uild/
 map_chunks_19x2/
 
-# Local App State
-imgui.ini
-mission_cache.dat
-
-# Deprecated/Unused Files
+# Visual Studio specific
+terrain_data.bin
+.vs/
+*.user
+*.suo
+*.pdb
+*.ilk
+*.aps
