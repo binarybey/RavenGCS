@@ -8,6 +8,7 @@ map_chunks_19x2/
 
 # Visual Studio specific
 terrain_data.bin
+imgui.ini
 mission_cache.dat
 .vs/
 *.user
