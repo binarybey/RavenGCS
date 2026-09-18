@@ -1306,8 +1306,6 @@ namespace MapCanvas {
         ImGui::SliderInt("Step Grouping", &step_grouping, 1, 20, "%d steps");
         if (ImGui::IsItemDeactivatedAfterEdit()) SaveSession();
 
-        ImGui::TextDisabled("Climb starts %d step(s) early; descend starts %d step(s) late.",
-            tile_offset, tile_offset);
 
         ImGui::Separator();
         const bool can_export = waypoints.size() >= 2 &&
@@ -1457,7 +1455,7 @@ namespace MapCanvas {
                 else if (mp.modes[s] == MODE_DESCEND) n_desc += mp.steps[s].count;
                 else n_level += mp.steps[s].count;
             }
-            ImGui::TextDisabled("%zu tiles / %zu steps  |  flat %d  climb %d  descend %d",
+            ImGui::TextDisabled("%zu tiles / %zu steps\nflat %d  climb %d  descend %d",
                 mp.tiles.size(), mp.steps.size(), n_level, n_climb, n_desc);
             if (mp.left_map)
                 ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.0f, 1.0f),
