@@ -122,7 +122,7 @@ int main(int, char**)
         HRESULT hr = g_pSwapChain->Present(1, 0);   // Present with vsync
         g_SwapChainOccluded = (hr == DXGI_STATUS_OCCLUDED);
     }
-
+    MapCanvas::Shutdown();
     // Cleanup
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();

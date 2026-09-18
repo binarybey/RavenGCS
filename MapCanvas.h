@@ -23,6 +23,7 @@ namespace MapCanvas {
 
     bool LoadTextureFromFile(ID3D11Device* d3dDevice, const char* filename, ID3D11ShaderResourceView** out_srv, int* out_width, int* out_height, unsigned char** out_cpu_data);
     void Initialize(ID3D11Device* d3dDevice);
+    void Shutdown();
     void RenderInteractiveMap();
     void ExportMissionFCode();
     void RenderControlPanelUI();
