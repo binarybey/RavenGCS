@@ -16,3 +16,4 @@ mission_cache.dat
 *.pdb
 *.ilk
 *.aps
+*.filters
