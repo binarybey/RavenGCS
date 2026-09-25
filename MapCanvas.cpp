@@ -1,14 +1,5 @@
-// ============================================================================
-//  MapCanvas.cpp  -  RAVEN Flight Path Manager
-//  Revised: bug fixes + performance pass.  See BUGFIX tags throughout.
-//
-//  REQUIRES a 64-bit (x64) build. The elevation raster is 68400 x 21600 x 4B
-//  = 5.9 GB and is mapped in one shot; a 32-bit process cannot address it and
-//  (size_t)y * MAP_W would overflow. A static_assert below enforces this.
-// ============================================================================
-
 #define IMGUI_DEFINE_MATH_OPERATORS
-#define NOMINMAX                    // BUGFIX #18: windows.h max/min macros collide with std::
+#define NOMINMAX                    
 #include <windows.h>
 #include "imgui.h"
 #include "imgui_internal.h"
@@ -22,7 +13,7 @@
 #include <string>
 #include <fstream>
 #include <commdlg.h>
-#include <algorithm>                // BUGFIX #19: std::remove_if / std::max were used without this
+#include <algorithm>                
 #include <cstdint>
 #include <climits>
 #include <cstring>
@@ -33,33 +24,27 @@ namespace MapCanvas {
         "MapCanvas requires a 64-bit build: the 5.9 GB elevation map cannot be "
         "mapped or indexed in a 32-bit address space.");
 
-    // Local clamp: std::clamp is C++17 and Visual Studio still defaults new
-    // projects to /std:c++14, so this file does not depend on it.
     template <typename T> static inline T Clamp(T v, T lo, T hi) {
         return (v < lo) ? lo : ((v > hi) ? hi : v);
     }
 
-    // ---------------------------------------------------------------- constants
-    // BUGFIX #23: these magic numbers were scattered as literals (68400, 21600,
-    // 15.0f, 26, 42) across ~30 sites. One typo anywhere was a silent misread.
-    constexpr int   MAP_W = 68400;          // 19 deg of longitude in arc-seconds
-    constexpr int   MAP_H = 21600;          //  6 deg of latitude  in arc-seconds
-    constexpr int   ORIGIN_LON_DEG = 26;    // west edge
-    constexpr int   ORIGIN_LAT_DEG = 42;    // north edge
+    constexpr int   MAP_W = 68400;
+    constexpr int   MAP_H = 21600;
+    constexpr int   ORIGIN_LON_DEG = 26;
+    constexpr int   ORIGIN_LAT_DEG = 42;
     constexpr int   TILE_W = 3600;
     constexpr int   TILE_H = 10800;
     constexpr int   CHUNK_ROWS = 2;
     constexpr int   CHUNK_COLS = 19;
     constexpr int   CHUNK_TOTAL = CHUNK_ROWS * CHUNK_COLS;
-    constexpr float PRECISION_ZOOM = 15.0f; // zoom above which waypoints may be dropped
+    constexpr float PRECISION_ZOOM = 15.0f;
     constexpr float ZOOM_MIN = 0.01f;
     constexpr float ZOOM_MAX = 30.0f;
-    constexpr float METERS_PER_TILE = 30.0f;
+    constexpr float METERS_PER_TILE = 30.87f;
 
-    // Flight modes. Named so the F-Code N-word mapping is auditable.
-    constexpr int MODE_LEVEL = 0;   // relatively-flat
-    constexpr int MODE_CLIMB = 1;   // climbing-zone
-    constexpr int MODE_DESCEND = 2; // descending-zone
+    constexpr int MODE_LEVEL = 0;
+    constexpr int MODE_CLIMB = 1;
+    constexpr int MODE_DESCEND = 2;
 
     enum class AppState {
         IDLE,
@@ -85,31 +70,23 @@ namespace MapCanvas {
 
     static std::atomic<int>  loaded_chunks = 0;
     static std::atomic<bool> map_loaded = false;
-    static std::atomic<bool> shutdown_requested = false;   // BUGFIX #8
-    static std::thread       loader_thread;                // BUGFIX #8: was detached
+    static std::atomic<bool> shutdown_requested = false;
+    static std::thread       loader_thread;
 
     static HANDLE hMapFile = NULL;
     static float* elevation_data = nullptr;
-    static bool   elevation_ready = false;                 // BUGFIX #6
+    static bool   elevation_ready = false;
     static std::string elevation_error;
 
     static int mode_threshold = 15;
     static int tile_offset = 3;
     static int step_grouping = 3;
 
-    // Virtual Camera State
     static float  zoom = 0.012f;
     static ImVec2 scroll_pos = ImVec2(0.0f, 0.0f);
 
-    // Safety Lock State
     bool precisionLockMet = false;
 
-    // ------------------------------------------------------- elevation sampling
-    // BUGFIX #5 (CRITICAL / crash): every elevation read in the raycast was
-    // unbounded. An arc that leaves the map produces a negative tile index;
-    // (size_t)(-1) * 68400 is an astronomically large offset into a memory-mapped
-    // view -> access violation. Arcs leave the map routinely (large radius, or a
-    // centre arc placed near an edge), so this was a reliable hard crash.
     static inline float SampleElevation(int x, int y) {
         if (!elevation_data) return 0.0f;
         if (x < 0) x = 0; else if (x >= MAP_W) x = MAP_W - 1;
@@ -118,14 +95,11 @@ namespace MapCanvas {
     }
 
     static inline bool InMap(int x, int y) {
-        return x >= 0 && x < MAP_W&& y >= 0 && y < MAP_H;
+        return x >= 0 && x < MAP_W && y >= 0 && y < MAP_H;
     }
 
-    // BUGFIX #12: (int) truncates toward zero, so (int)(-0.5) == 0 while the tile
-    // is actually -1. Every tile index derived from a path point must floor.
     static inline int TileOf(float v) { return (int)std::floor(v); }
 
-    // ------------------------------------------------------------- texture load
     bool LoadTextureFromFile(ID3D11Device* d3dDevice, const char* filename,
         ID3D11ShaderResourceView** out_srv, int* out_width,
         int* out_height, unsigned char** out_cpu_data)
@@ -170,8 +144,6 @@ namespace MapCanvas {
     void LoadMapTexturesAsync(ID3D11Device* d3dDevice) {
         for (int r = 0; r < CHUNK_ROWS; r++) {
             for (int c = 0; c < CHUNK_COLS; c++) {
-                // BUGFIX #8: bail out promptly if the window is closing, so we are
-                // not calling CreateTexture2D on a device main() is about to release.
                 if (shutdown_requested.load(std::memory_order_acquire)) return;
 
                 char filename[256];
@@ -186,8 +158,6 @@ namespace MapCanvas {
                 loaded_chunks++;
             }
         }
-        // Release store: pairs with the acquire load in RenderInteractiveMap and
-        // publishes every texMap write above.
         map_loaded.store(true, std::memory_order_release);
     }
 
@@ -202,9 +172,6 @@ namespace MapCanvas {
             return;
         }
 
-        // BUGFIX #6b: verify the file is actually the size we are about to index.
-        // A truncated or half-written .bin previously produced silent garbage
-        // elevations (or a fault) rather than an error.
         LARGE_INTEGER sz{};
         const long long expected = (long long)MAP_W * (long long)MAP_H * (long long)sizeof(float);
         if (!GetFileSizeEx(hFile, &sz) || sz.QuadPart < expected) {
@@ -233,13 +200,9 @@ namespace MapCanvas {
     void Initialize(ID3D11Device* d3dDevice) {
         LoadSession();
         LoadElevationData();
-        // BUGFIX #8: joinable, not detached. Closing the window mid-load used to
-        // race CleanupDeviceD3D() against CreateTexture2D() on a dead device.
         loader_thread = std::thread(LoadMapTexturesAsync, d3dDevice);
     }
 
-    // BUGFIX #7: nothing was ever released. Declare this in MapCanvas.h and call
-    // it from main.cpp before CleanupDeviceD3D().
     void Shutdown() {
         shutdown_requested.store(true, std::memory_order_release);
         if (loader_thread.joinable()) loader_thread.join();
@@ -253,19 +216,9 @@ namespace MapCanvas {
         elevation_ready = false;
     }
 
-    // ========================================================================
-    //  FLIGHT PATH  (cached)
-    // ========================================================================
-    // BUGFIX #16 (PERF, the big one): GenerateFlightPath() copied the whole
-    // waypoint vector and re-tessellated every arc EVERY FRAME, and the caller
-    // then re-raycast the entire path and re-read the elevation map for every
-    // tile - thousands of random reads into a 5.9 GB memory-mapped file at 60 Hz.
-    // Everything below is now rebuilt only when an input actually changes.
-
     static std::vector<ImVec2> cached_path;
     static uint64_t cached_path_key = ~0ull;
 
-    // Cheap order-sensitive hash of everything the path/profile depends on.
     static uint64_t HashInputs(bool include_profile_params) {
         uint64_t h = 1469598103934665603ull;
         auto mix = [&h](uint64_t v) { h ^= v; h *= 1099511628211ull; };
@@ -288,6 +241,47 @@ namespace MapCanvas {
         return h;
     }
 
+    static bool Arc3PtGeometry(const Waypoint& a, const Waypoint& b, const Waypoint& c,
+        double& Xc, double& Yc, double& R,
+        double& start_angle, double& sweep)
+    {
+        const double lat_rad = (ORIGIN_LAT_DEG - (a.raw_y / 3600.0)) * (3.1415926535 / 180.0);
+        const double cos_lat = std::cos(lat_rad);
+
+        const double x1 = a.raw_x * cos_lat, y1 = a.raw_y;
+        const double x2 = (double)b.raw_x * cos_lat - x1, y2 = (double)b.raw_y - y1;
+        const double x3 = (double)c.raw_x * cos_lat - x1, y3 = (double)c.raw_y - y1;
+        const double D = 2.0 * (x2 * y3 - x3 * y2);
+        if (std::abs(D) <= 0.1) return false;
+
+        const double Xc_rel = ((x2 * x2 + y2 * y2) * y3 - (x3 * x3 + y3 * y3) * y2) / D;
+        const double Yc_rel = ((x3 * x3 + y3 * y3) * x2 - (x2 * x2 + y2 * y2) * x3) / D;
+
+        Xc = (x1 + Xc_rel) / cos_lat;
+        Yc = y1 + Yc_rel;
+        R = std::sqrt(Xc_rel * Xc_rel + Yc_rel * Yc_rel);
+
+        start_angle = std::atan2(-Yc_rel, -Xc_rel);
+        const double mid_angle = std::atan2(y2 - Yc_rel, x2 - Xc_rel);
+        const double end_angle = std::atan2(y3 - Yc_rel, x3 - Xc_rel);
+
+        double diff = end_angle - start_angle;
+        while (diff <= -3.1415926535) diff += 6.2831853072;
+        while (diff > 3.1415926535) diff -= 6.2831853072;
+        double mid_diff = mid_angle - start_angle;
+        while (mid_diff <= -3.1415926535) mid_diff += 6.2831853072;
+        while (mid_diff > 3.1415926535) mid_diff -= 6.2831853072;
+
+        const bool missed_opposite = ((diff > 0.0 && mid_diff < 0.0) || (diff < 0.0 && mid_diff > 0.0));
+        const bool missed_overshoot = ((diff > 0.0 && mid_diff > 0.0 && mid_diff > diff) ||
+            (diff < 0.0 && mid_diff < 0.0 && mid_diff < diff));
+        if (missed_opposite || missed_overshoot) diff += (diff > 0.0) ? -6.2831853072 : 6.2831853072;
+        if (a.center_angle > 0.5f)                diff += (diff > 0.0) ? -6.2831853072 : 6.2831853072;
+
+        sweep = diff;
+        return true;
+    }
+
     static void BuildFlightPath(std::vector<ImVec2>& path) {
         path.clear();
 
@@ -303,55 +297,24 @@ namespace MapCanvas {
                 all_wps[i + 1].type == WpType::Arc3Pt &&
                 all_wps[i + 2].type == WpType::Arc3Pt)
             {
-                double x2 = (double)all_wps[i + 1].raw_x - (double)all_wps[i].raw_x;
-                double y2 = (double)all_wps[i + 1].raw_y - (double)all_wps[i].raw_y;
-                double x3 = (double)all_wps[i + 2].raw_x - (double)all_wps[i].raw_x;
-                double y3 = (double)all_wps[i + 2].raw_y - (double)all_wps[i].raw_y;
-                double D = 2.0 * (x2 * y3 - x3 * y2);
+                double Xc, Yc, R, sa, sweep;
+                if (Arc3PtGeometry(all_wps[i], all_wps[i + 1], all_wps[i + 2], Xc, Yc, R, sa, sweep)) {
+                    const double lat_rad = (ORIGIN_LAT_DEG - (all_wps[i].raw_y / 3600.0)) * (3.1415926535 / 180.0);
+                    const double cos_lat = std::cos(lat_rad);
 
-                if (std::abs(D) < 0.1) {
-                    // Collinear: degenerate to the three points.
-                    path.push_back(ImVec2(all_wps[i].raw_x, all_wps[i].raw_y));
-                    path.push_back(ImVec2(all_wps[i + 1].raw_x, all_wps[i + 1].raw_y));
-                    path.push_back(ImVec2(all_wps[i + 2].raw_x, all_wps[i + 2].raw_y));
-                }
-                else {
-                    double Xc_rel = ((x2 * x2 + y2 * y2) * y3 - (x3 * x3 + y3 * y3) * y2) / D;
-                    double Yc_rel = ((x3 * x3 + y3 * y3) * x2 - (x2 * x2 + y2 * y2) * x3) / D;
-                    double Xc = (double)all_wps[i].raw_x + Xc_rel;
-                    double Yc = (double)all_wps[i].raw_y + Yc_rel;
-                    double R = std::sqrt(Xc_rel * Xc_rel + Yc_rel * Yc_rel);
-
-                    double start_angle = std::atan2((double)all_wps[i].raw_y - Yc, (double)all_wps[i].raw_x - Xc);
-                    double mid_angle = std::atan2((double)all_wps[i + 1].raw_y - Yc, (double)all_wps[i + 1].raw_x - Xc);
-                    double end_angle = std::atan2((double)all_wps[i + 2].raw_y - Yc, (double)all_wps[i + 2].raw_x - Xc);
-
-                    double angle_diff = end_angle - start_angle;
-                    while (angle_diff <= -3.1415926535) angle_diff += 6.2831853072;
-                    while (angle_diff > 3.1415926535)  angle_diff -= 6.2831853072;
-
-                    double mid_diff = mid_angle - start_angle;
-                    while (mid_diff <= -3.1415926535) mid_diff += 6.2831853072;
-                    while (mid_diff > 3.1415926535)  mid_diff -= 6.2831853072;
-
-                    bool missed_opposite = ((angle_diff > 0.0 && mid_diff < 0.0) || (angle_diff < 0.0 && mid_diff > 0.0));
-                    bool missed_overshoot = ((angle_diff > 0.0 && mid_diff > 0.0 && mid_diff > angle_diff) ||
-                        (angle_diff < 0.0 && mid_diff < 0.0 && mid_diff < angle_diff));
-                    if (missed_opposite || missed_overshoot) angle_diff += (angle_diff > 0.0) ? -6.2831853072 : 6.2831853072;
-                    if (all_wps[i].center_angle > 0.5f)      angle_diff += (angle_diff > 0.0) ? -6.2831853072 : 6.2831853072;
-
-                    // OPT: tessellate by arc LENGTH, not by angle. The old rule
-                    // (30 points per radian) gave a 4000-tile-radius arc the same
-                    // point count as a 5-tile one: the first was visibly faceted,
-                    // the second wasted hundreds of sub-pixel points.
-                    double arc_len_tiles = R * std::abs(angle_diff);
+                    double arc_len_tiles = R * std::abs(sweep);
                     int segments = (int)Clamp(arc_len_tiles * 0.5, 16.0, 4000.0);
 
                     for (int j = 0; j <= segments; j++) {
                         double t = (double)j / (double)segments;
-                        double a = start_angle + angle_diff * t;
-                        path.push_back(ImVec2((float)(Xc + R * std::cos(a)), (float)(Yc + R * std::sin(a))));
+                        double a = sa + sweep * t;
+                        path.push_back(ImVec2((float)(Xc + (R * std::cos(a)) / cos_lat), (float)(Yc + R * std::sin(a))));
                     }
+                }
+                else {
+                    path.push_back(ImVec2(all_wps[i].raw_x, all_wps[i].raw_y));
+                    path.push_back(ImVec2(all_wps[i + 1].raw_x, all_wps[i + 1].raw_y));
+                    path.push_back(ImVec2(all_wps[i + 2].raw_x, all_wps[i + 2].raw_y));
                 }
                 i += 3;
                 continue;
@@ -360,9 +323,12 @@ namespace MapCanvas {
                 i + 1 < all_wps.size() &&
                 all_wps[i + 1].type == WpType::ArcCenterEnd)
             {
-                double sx = (double)all_wps[i].raw_x, sy = (double)all_wps[i].raw_y;
-                double cx = (double)all_wps[i + 1].raw_x, cy = (double)all_wps[i + 1].raw_y;
-                double dx = sx - cx, dy = sy - cy;
+                const double lat_rad = (ORIGIN_LAT_DEG - (all_wps[i].raw_y / 3600.0)) * (3.1415926535 / 180.0);
+                const double cos_lat = std::cos(lat_rad);
+
+                double sx_iso = (double)all_wps[i].raw_x * cos_lat, sy = (double)all_wps[i].raw_y;
+                double cx_iso = (double)all_wps[i + 1].raw_x * cos_lat, cy = (double)all_wps[i + 1].raw_y;
+                double dx = sx_iso - cx_iso, dy = sy - cy;
                 double R = std::sqrt(dx * dx + dy * dy);
 
                 double start_angle = std::atan2(dy, dx);
@@ -374,7 +340,7 @@ namespace MapCanvas {
                 for (int j = 0; j <= segments; j++) {
                     double t = (double)j / (double)segments;
                     double a = start_angle + sweep_angle * t;
-                    path.push_back(ImVec2((float)(cx + R * std::cos(a)), (float)(cy + R * std::sin(a))));
+                    path.push_back(ImVec2((float)((cx_iso + R * std::cos(a)) / cos_lat), (float)(cy + R * std::sin(a))));
                 }
                 i += 2;
                 continue;
@@ -394,54 +360,32 @@ namespace MapCanvas {
         return cached_path;
     }
 
-    // Public API kept byte-identical in signature for header compatibility.
     std::vector<ImVec2> GenerateFlightPath() { return GetCachedFlightPath(); }
-
-    // ========================================================================
-    //  MISSION PROFILE  -  single source of truth for renderer AND exporter
-    // ========================================================================
-    // BUGFIX #11 (CRITICAL / correctness): the raycast + step partitioning +
-    // mode classification existed TWICE, once in RenderInteractiveMap and once in
-    // ExportMissionFCode, and the two copies did not agree:
-    //
-    //   renderer : re-seeded the start tile of EVERY path segment and force-closed
-    //              the step at every segment boundary
-    //   exporter : seeded only the very first tile and never force-closed
-    //
-    // On a 90-degree arc of radius 400 that is 613 steps vs 567 steps and 814 vs
-    // 768 tiles counted. Because step_grouping buckets by step INDEX, a 46-step
-    // difference shifts every group boundary downstream - so the climb/descend
-    // zones you saw on screen were not the ones written to the F-Code file.
-    // There is now exactly one implementation and both callers use it.
 
     struct ProfileTile {
         int   x, y;
-        int   seg;   // index into flight_path; the tile lies on segment [seg-1, seg]
-        float t;     // parametric entry position along that segment, 0..1
+        int   seg;
+        float t;
     };
     struct ProfileStep {
-        int   first, last;   // inclusive index range into MissionProfile::tiles
+        int   first, last;
         float sum_elev;
         int   count;
     };
     struct MissionProfile {
-        std::vector<ProfileTile> tiles;   // deduplicated, in flight order
+        std::vector<ProfileTile> tiles;
         std::vector<ProfileStep> steps;
-        std::vector<int>         modes;   // final mode per step
-        bool  left_map = false;           // path wandered outside the raster
+        std::vector<int>         modes;
+        bool  left_map = false;
         void clear() { tiles.clear(); steps.clear(); modes.clear(); left_map = false; }
     };
 
     static MissionProfile cached_profile;
     static uint64_t       cached_profile_key = ~0ull;
 
-    // ------------------------------------------------ supercover raycast (once)
     static void RaycastPath(const std::vector<ImVec2>& path, MissionProfile& mp) {
         if (path.size() < 2) return;
 
-        // OPT: one allocation instead of a std::vector<UITile> per step. The old
-        // code heap-allocated a fresh vector for every one of the ~600 steps of a
-        // single arc, every frame.
         mp.tiles.reserve(path.size() * 2);
 
         int  prev_x = INT_MIN, prev_y = INT_MIN;
@@ -456,14 +400,11 @@ namespace MapCanvas {
             };
 
         auto emit = [&](int cx, int cy, bool axis_is_x, int seg, float t) {
-            if (cx == prev_x && cy == prev_y) return;   // dedupe shared endpoints
+            if (cx == prev_x && cy == prev_y) return;
             if (!InMap(cx, cy)) mp.left_map = true;
 
             int parent = axis_is_x ? cx : cy;
 
-            // A "step" is a maximal run of tiles sharing the same coordinate on the
-            // locally dominant axis, i.e. one arc-second of ground advance. It now
-            // survives across path-segment boundaries (see BUGFIX #11).
             if (!have_step) {
                 cur = ProfileStep{ (int)mp.tiles.size(), (int)mp.tiles.size(), 0.0f, 0 };
                 have_step = true;
@@ -480,14 +421,14 @@ namespace MapCanvas {
 
             mp.tiles.push_back(ProfileTile{ cx, cy, seg, t });
             cur.last = (int)mp.tiles.size() - 1;
-            cur.sum_elev += SampleElevation(cx, cy);   // BUGFIX #5: bounds-safe
+            cur.sum_elev += SampleElevation(cx, cy);
             cur.count++;
 
             prev_x = cx; prev_y = cy;
             };
 
         for (size_t i = 1; i < path.size(); i++) {
-            const int sx = TileOf(path[i - 1].x), sy = TileOf(path[i - 1].y);   // BUGFIX #12: floor, not trunc
+            const int sx = TileOf(path[i - 1].x), sy = TileOf(path[i - 1].y);
             const int ex = TileOf(path[i].x), ey = TileOf(path[i].y);
 
             const int dx = ex - sx, dy = ey - sy;
@@ -515,10 +456,6 @@ namespace MapCanvas {
             for (int s = 0; s < total_crossings; s++) {
                 if (cx == ex && cy == ey) break;
 
-                // BUGFIX #13: t was approximated as (crossing_index+1)/total_crossings,
-                // which is only correct when |dx| == |dy|. On a shallow diagonal the
-                // coloured segments drifted away from the tile boundaries they were
-                // supposed to mark. Use the DDA's own parametric value.
                 const double t_cross = (tMaxX < tMaxY) ? tMaxX : tMaxY;
 
                 if (std::abs(tMaxX - tMaxY) < 1e-8) {
@@ -535,13 +472,12 @@ namespace MapCanvas {
         close_step();
     }
 
-    // ------------------------------------------------- mode classification
     static void ClassifyModes(MissionProfile& mp) {
         const size_t n = mp.steps.size();
         mp.modes.assign(n, MODE_LEVEL);
         if (n == 0) return;
 
-        const int grouping = std::max(1, step_grouping);   // BUGFIX: guard 0/negative
+        const int grouping = std::max(1, step_grouping);
 
         std::vector<int> raw(n, MODE_LEVEL);
         int   mode = MODE_LEVEL;
@@ -552,20 +488,13 @@ namespace MapCanvas {
             const size_t end_idx = std::min(i + (size_t)grouping, n);
             for (size_t s = i; s < end_idx; s++) { sum += mp.steps[s].sum_elev; cnt += mp.steps[s].count; }
 
-            // BUGFIX #2: cnt was assumed non-zero; a zero-length group produced a
-            // NaN delta_z, and NaN fails every comparison, silently freezing the
-            // mode for the rest of the mission.
             const float group_elev = (cnt > 0) ? (sum / (float)cnt) : prev_group_elev;
             if (i == 0) prev_group_elev = group_elev;
             const float delta_z = group_elev - prev_group_elev;
 
             const float up = (float)mode_threshold;
-            const float rel = (float)mode_threshold * 0.5f;   // hysteresis band
+            const float rel = (float)mode_threshold * 0.5f;
 
-            // BUGFIX #3: the original could not transition CLIMB -> DESCEND directly;
-            // it had to pass through LEVEL, costing one whole group of lag on every
-            // ridge crossing on top of tile_offset. Direct reversals are allowed now,
-            // with the hysteresis band preserved.
             if (mode == MODE_CLIMB) {
                 if (delta_z < -up)      mode = MODE_DESCEND;
                 else if (delta_z < rel) mode = MODE_LEVEL;
@@ -583,30 +512,6 @@ namespace MapCanvas {
             prev_group_elev = group_elev;
         }
 
-        // ================== BUGFIX #1: THE DESCEND OFFSET BUG ==================
-        // Original:
-        //     for each boundary s where raw[s] != raw[s-1]:
-        //         paint final[s-1 .. s-tile_offset] = raw[s]
-        //
-        // That pulled EVERY transition earlier, in both directions. For a climb
-        // that is what you want - start climbing before the ground rises. For a
-        // descent it is exactly backwards: the aircraft starts dropping while it
-        // is still over the high ground it has not cleared yet.
-        //
-        // It also silently shifted the climb instead of extending it: the
-        // CLIMB->LEVEL boundary moved earlier too, so the climb ended
-        // tile_offset steps short of the ridge line.
-        //
-        // Fixed rule, applied per contiguous run:
-        //     CLIMB   [a,b] -> [a - tile_offset, b]            anticipate the rise,
-        //                                                      keep climbing to the top
-        //     DESCEND [a,b] -> [a + tile_offset, b + tile_offset]  defer the drop,
-        //                                                      keep the descent length
-        // Climb runs are painted last, so on a sharp ridge (climb immediately
-        // followed by descend) the climb wins the overlap. The bias is always
-        // toward being too high, never too low.
-        //
-        // tile_offset == 0 is an exact no-op.
         const int off = std::max(0, tile_offset);
 
         auto paint_runs = [&](int target, int shift_start, int shift_end) {
@@ -622,9 +527,8 @@ namespace MapCanvas {
             }
             };
 
-        paint_runs(MODE_DESCEND, +off, +off);   // defer  (shift whole run later)
-        paint_runs(MODE_CLIMB, -off, 0);      // anticipate (extend run earlier)
-        // ======================================================================
+        paint_runs(MODE_DESCEND, +off, +off);
+        paint_runs(MODE_CLIMB, -off, 0);
     }
 
     static const MissionProfile& GetMissionProfile() {
@@ -641,17 +545,7 @@ namespace MapCanvas {
 
     static void InvalidateProfile() { cached_profile_key = ~0ull; cached_path_key = ~0ull; }
 
-    // ========================================================================
-    //  ELEVATION BAND SHADING  (cached + run-length merged)
-    // ========================================================================
-    // BUGFIX #17 (PERF): the old loop emitted one AddRectFilled per ~1 screen
-    // pixel over the whole canvas, re-reading the memory-mapped elevation file
-    // each time. Its "safety valve" allowed 3000 x 3000 = 9,000,000 quads per
-    // frame (36M vertices), which is an instant freeze. Now: cells are at least
-    // MIN_CELL_PX across, horizontally adjacent cells of the same tier are merged
-    // into runs, and the whole run list is cached until the visible tile window
-    // actually changes - so panning by a sub-tile amount costs zero elevation reads.
-    struct BandRun { int x0, x1, y; };           // map-space, [x0,x1) at row y
+    struct BandRun { int x0, x1, y; };
     static std::vector<BandRun> band_runs;
     static int bk_fx = INT_MIN, bk_lx = 0, bk_fy = 0, bk_ly = 0, bk_step = 0, bk_tier = 0;
     constexpr float MIN_CELL_PX = 3.0f;
@@ -674,9 +568,6 @@ namespace MapCanvas {
         }
     }
 
-    // ========================================================================
-    //  RENDER
-    // ========================================================================
     void RenderInteractiveMap() {
         if (!map_loaded.load(std::memory_order_acquire)) {
             const float window_width = ImGui::GetWindowSize().x;
@@ -730,7 +621,6 @@ namespace MapCanvas {
             zoom = new_zoom;
         }
 
-        // Camera clamp: keep the screen centre inside the map
         const float half_w = (canvas_sz.x * 0.5f) / zoom;
         const float half_h = (canvas_sz.y * 0.5f) / zoom;
         scroll_pos.x = Clamp(scroll_pos.x, -(float)MAP_W + half_w, half_w);
@@ -741,7 +631,6 @@ namespace MapCanvas {
         const ImVec2 map_origin = ImVec2(canvas_p0.x + scroll_pos.x * zoom,
             canvas_p0.y + scroll_pos.y * zoom);
 
-        // --- basemap chunks (frustum culled) ---
         for (int r = 0; r < CHUNK_ROWS; r++) {
             for (int c = 0; c < CHUNK_COLS; c++) {
                 if (!texMap[r][c]) continue;
@@ -752,7 +641,6 @@ namespace MapCanvas {
             }
         }
 
-        // --- input: escape cancels a pending arc ---
         if (ImGui::IsKeyPressed(ImGuiKey_Escape) && current_state != AppState::IDLE) {
             current_state = AppState::IDLE;
             temp_arc_points.clear();
@@ -780,8 +668,6 @@ namespace MapCanvas {
                         wp.lon_sec = (ORIGIN_LON_DEG * 3600) + tile_x;
                         wp.lat_sec = (ORIGIN_LAT_DEG * 3600) - tile_y;
 
-                        // Next free arc group id, computed once here rather than in
-                        // three near-duplicate blocks.
                         auto next_group = [&]() {
                             int mx = 0;
                             for (const auto& w : waypoints)       mx = std::max(mx, w.group_id);
@@ -838,7 +724,6 @@ namespace MapCanvas {
                 }
             }
 
-            // Right click: delete. Arc members take the whole group with them.
             if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
                 const int click_tile_x = TileOf((io.MousePos.x - map_origin.x) / zoom);
                 const int click_tile_y = TileOf((io.MousePos.y - map_origin.y) / zoom);
@@ -872,7 +757,6 @@ namespace MapCanvas {
             }
         }
 
-        // ---------------------------------------------------------- geo grid
         const float degStep = 3600.0f * zoom;
         const float minStep = 60.0f * zoom;
         const float secStep = 1.0f * zoom;
@@ -906,7 +790,7 @@ namespace MapCanvas {
 
         if (show_minute_grid && minStep > 10.0f) {
             const ImU32 minColor = IM_COL32(239, 63, 255, 127);
-            const ImU32 textColor = IM_COL32(127, 127, 127, 220);
+            const ImU32 textColor = IM_COL32(191, 191, 191, 220);
             const float center_x = canvas_p0.x + canvas_sz.x * 0.5f;
             const float center_y = canvas_p0.y + canvas_sz.y * 0.5f;
 
@@ -947,7 +831,6 @@ namespace MapCanvas {
             }
         }
 
-        // ------------------------------------------- arc-second grid + tooltip
         static float hover_timer = 0.0f;
 
         if (secStep > PRECISION_ZOOM) {
@@ -1000,7 +883,6 @@ namespace MapCanvas {
             hover_timer = 0.0f;
         }
 
-        // ------------------------------------------------- elevation band shading
         const float meters_per_pixel = METERS_PER_TILE / zoom;
         const int tier_interval = std::max(50, (int)std::lround(meters_per_pixel / 10.0f) * 50);
 
@@ -1012,7 +894,6 @@ namespace MapCanvas {
             int first_y = std::max(0, (int)std::floor((canvas_p0.y - map_origin.y) / secStep));
             int last_y = std::min(MAP_H - 1, (int)std::ceil((canvas_p1.y - map_origin.y) / secStep));
 
-            // Snap the window to the step lattice so bands do not crawl while panning.
             first_x -= (first_x % map_step);
             first_y -= (first_y % map_step);
 
@@ -1036,7 +917,6 @@ namespace MapCanvas {
             }
         }
 
-        // ------------------------------------------------------------ HUD legend
         {
             char legend_buf[64];
             snprintf(legend_buf, sizeof(legend_buf), "Contour Interval: %d m", tier_interval);
@@ -1047,9 +927,6 @@ namespace MapCanvas {
         }
 
         if (!elevation_ready) {
-            // BUGFIX #6: a missing/short terrain_data.bin used to read as elevation 0
-            // everywhere, so every segment classified "relatively-flat" and the export
-            // produced a plausible-looking but completely wrong F-Code file.
             const ImVec2 wp_ = ImVec2(canvas_p0.x + 15.0f, canvas_p0.y + 15.0f);
             const char* msg = elevation_error.empty() ? "Elevation data unavailable" : elevation_error.c_str();
             const ImVec2 ts = ImGui::CalcTextSize(msg);
@@ -1057,7 +934,6 @@ namespace MapCanvas {
             draw_list->AddText(ImVec2(wp_.x + 10.0f, wp_.y + 5.0f), IM_COL32(255, 220, 220, 255), msg);
         }
 
-        // ============================ PASS 1: PATH ============================
         const ImU32 outlineColor = IM_COL32(255, 255, 255, 200);
         const ImU32 markerColor = IM_COL32(255, 50, 50, 255);
 
@@ -1072,7 +948,6 @@ namespace MapCanvas {
 
         if (!mp.steps.empty() && flight_path.size() > 1) {
 
-            // Coloured tile overlay (only meaningful at precision zoom)
             if (zoom > PRECISION_ZOOM) {
                 for (size_t s = 0; s < mp.steps.size(); s++) {
                     const ImU32 col = mode_color(mp.modes[s], 100);
@@ -1081,8 +956,6 @@ namespace MapCanvas {
                         const ProfileTile& t = mp.tiles[ti];
                         const float sx = map_origin.x + t.x * zoom;
                         const float sy = map_origin.y + t.y * zoom;
-                        // OPT: the old loop issued a draw call for every tile of the
-                        // entire mission, including tiles far off screen.
                         if (sx + zoom < canvas_p0.x || sx > canvas_p1.x ||
                             sy + zoom < canvas_p0.y || sy > canvas_p1.y) continue;
                         draw_list->AddRectFilled(ImVec2(sx, sy), ImVec2(sx + zoom, sy + zoom), col);
@@ -1090,7 +963,6 @@ namespace MapCanvas {
                 }
             }
 
-            // Exact mathematical centreline, coloured per step.
             auto point_at = [&](int seg, float t) -> ImVec2 {
                 const ImVec2& a = flight_path[seg - 1];
                 const ImVec2& b = flight_path[seg];
@@ -1107,8 +979,6 @@ namespace MapCanvas {
                 const ProfileTile& t0 = mp.tiles[st.first];
                 if (t0.seg <= 0 || t0.seg >= (int)flight_path.size()) continue;
 
-                // The step ends where the next tile begins; the last step runs to the
-                // end of its segment.
                 int   seg_b; float t_b;
                 if (st.last + 1 < (int)mp.tiles.size()) {
                     seg_b = mp.tiles[st.last + 1].seg;
@@ -1132,7 +1002,6 @@ namespace MapCanvas {
             }
         }
 
-        // ========================== PASS 2: MARKERS ==========================
         auto draw_marker = [&](float r_x, float r_y, const char* label, ImU32 color, bool is_center_dot) {
             const float cx = map_origin.x + (r_x + 0.5f) * zoom;
             const float cy = map_origin.y + (r_y + 0.5f) * zoom;
@@ -1146,18 +1015,21 @@ namespace MapCanvas {
                 draw_list->AddRect(ImVec2(p0x, p0y), ImVec2(p0x + zoom, p0y + zoom), color, 0.0f, 0, 1.5f);
             }
             else {
-                const float arm = is_center_dot ? 8.0f : 20.0f;
-                draw_list->AddCircleFilled(ImVec2(cx, cy), is_center_dot ? 3.0f : 4.0f, color);
-                if (!is_center_dot) draw_list->AddCircle(ImVec2(cx, cy), 12.0f, outlineColor, 0, 1.5f);
+                const float arm = is_center_dot ? 4.0f : 10.0f;
+
+                draw_list->AddCircleFilled(ImVec2(cx, cy), is_center_dot ? 2.0f : 2.5f, color);
+
+                if (!is_center_dot) draw_list->AddCircle(ImVec2(cx, cy), 6.0f, outlineColor, 0, 1.5f);
+
                 draw_list->AddLine(ImVec2(cx - arm, cy), ImVec2(cx + arm, cy), color, 2.0f);
                 draw_list->AddLine(ImVec2(cx, cy - arm), ImVec2(cx, cy + arm), color, 2.0f);
             }
-            draw_list->AddText(ImVec2(cx + 10, cy - 20), outlineColor, label);
+
+            draw_list->AddText(ImVec2(cx + 6, cy - 14), outlineColor, label);
             };
 
         int display_wp_idx = 1;
         for (size_t i = 0; i < waypoints.size(); ) {
-            // BUGFIX #25: bounds are now checked BEFORE indexing i+1 / i+2.
             if (waypoints[i].type == WpType::Arc3Pt && i + 2 < waypoints.size()) {
                 const std::string pfx = "3C" + std::to_string(waypoints[i].group_id);
                 draw_marker(waypoints[i].raw_x, waypoints[i].raw_y, (pfx + "_Start").c_str(), markerColor, false);
@@ -1165,13 +1037,8 @@ namespace MapCanvas {
                     draw_marker(waypoints[i + 1].raw_x, waypoints[i + 1].raw_y, (pfx + "_Mid").c_str(), markerColor, false);
                 draw_marker(waypoints[i + 2].raw_x, waypoints[i + 2].raw_y, (pfx + "_End").c_str(), markerColor, false);
 
-                const double x1 = waypoints[i].raw_x, y1 = waypoints[i].raw_y;
-                const double x2 = (double)waypoints[i + 1].raw_x - x1, y2 = (double)waypoints[i + 1].raw_y - y1;
-                const double x3 = (double)waypoints[i + 2].raw_x - x1, y3 = (double)waypoints[i + 2].raw_y - y1;
-                const double D = 2.0 * (x2 * y3 - x3 * y2);
-                if (std::abs(D) > 0.1) {
-                    const double Xc = x1 + ((x2 * x2 + y2 * y2) * y3 - (x3 * x3 + y3 * y3) * y2) / D;
-                    const double Yc = y1 + ((x3 * x3 + y3 * y3) * x2 - (x2 * x2 + y2 * y2) * x3) / D;
+                double Xc, Yc, R, sa, sweep;
+                if (Arc3PtGeometry(waypoints[i], waypoints[i + 1], waypoints[i + 2], Xc, Yc, R, sa, sweep)) {
                     draw_marker((float)Xc, (float)Yc, (pfx + "_Center").c_str(), IM_COL32(255, 165, 0, 255), true);
                 }
                 i += 3;
@@ -1181,12 +1048,16 @@ namespace MapCanvas {
                 draw_marker(waypoints[i].raw_x, waypoints[i].raw_y, (pfx + "_Start").c_str(), markerColor, false);
                 draw_marker(waypoints[i + 1].raw_x, waypoints[i + 1].raw_y, (pfx + "_Center").c_str(), IM_COL32(255, 165, 0, 255), true);
 
-                const double sx = waypoints[i].raw_x, sy = waypoints[i].raw_y;
-                const double cx = waypoints[i + 1].raw_x, cy = waypoints[i + 1].raw_y;
-                const double dx = sx - cx, dy = sy - cy;
+                const double lat_rad = (ORIGIN_LAT_DEG - (waypoints[i].raw_y / 3600.0)) * (3.1415926535 / 180.0);
+                const double cos_lat = std::cos(lat_rad);
+
+                const double sx_iso = (double)waypoints[i].raw_x * cos_lat, sy = (double)waypoints[i].raw_y;
+                const double cx_iso = (double)waypoints[i + 1].raw_x * cos_lat, cy = (double)waypoints[i + 1].raw_y;
+                const double dx = sx_iso - cx_iso, dy = sy - cy;
                 const double R = std::sqrt(dx * dx + dy * dy);
                 const double ea = std::atan2(dy, dx) + (waypoints[i + 1].center_angle * (3.1415926535 / 180.0));
-                draw_marker((float)(cx + R * std::cos(ea)), (float)(cy + R * std::sin(ea)), (pfx + "_End").c_str(), markerColor, false);
+
+                draw_marker((float)((cx_iso + R * std::cos(ea)) / cos_lat), (float)(cy + R * std::sin(ea)), (pfx + "_End").c_str(), markerColor, false);
                 i += 2;
             }
             else {
@@ -1202,52 +1073,6 @@ namespace MapCanvas {
         draw_list->PopClipRect();
     }
 
-    // ========================================================================
-    //  3-POINT ARC GEOMETRY  (was duplicated verbatim in four places)
-    // ========================================================================
-    // BUGFIX/OPT: the centre-solve + sweep-disambiguation block appeared in
-    // BuildFlightPath, the marker pass, the waypoint list and the distance
-    // readout. Four copies meant four chances to fix a sign in only three of them.
-    static bool Arc3PtGeometry(const Waypoint& a, const Waypoint& b, const Waypoint& c,
-        double& Xc, double& Yc, double& R,
-        double& start_angle, double& sweep)
-    {
-        const double x1 = a.raw_x, y1 = a.raw_y;
-        const double x2 = (double)b.raw_x - x1, y2 = (double)b.raw_y - y1;
-        const double x3 = (double)c.raw_x - x1, y3 = (double)c.raw_y - y1;
-        const double D = 2.0 * (x2 * y3 - x3 * y2);
-        if (std::abs(D) <= 0.1) return false;               // collinear
-
-        const double Xc_rel = ((x2 * x2 + y2 * y2) * y3 - (x3 * x3 + y3 * y3) * y2) / D;
-        const double Yc_rel = ((x3 * x3 + y3 * y3) * x2 - (x2 * x2 + y2 * y2) * x3) / D;
-        Xc = x1 + Xc_rel;
-        Yc = y1 + Yc_rel;
-        R = std::sqrt(Xc_rel * Xc_rel + Yc_rel * Yc_rel);
-
-        start_angle = std::atan2(-Yc_rel, -Xc_rel);
-        const double mid_angle = std::atan2(y2 - Yc_rel, x2 - Xc_rel);
-        const double end_angle = std::atan2(y3 - Yc_rel, x3 - Xc_rel);
-
-        double diff = end_angle - start_angle;
-        while (diff <= -3.1415926535) diff += 6.2831853072;
-        while (diff > 3.1415926535) diff -= 6.2831853072;
-        double mid_diff = mid_angle - start_angle;
-        while (mid_diff <= -3.1415926535) mid_diff += 6.2831853072;
-        while (mid_diff > 3.1415926535) mid_diff -= 6.2831853072;
-
-        const bool missed_opposite = ((diff > 0.0 && mid_diff < 0.0) || (diff < 0.0 && mid_diff > 0.0));
-        const bool missed_overshoot = ((diff > 0.0 && mid_diff > 0.0 && mid_diff > diff) ||
-            (diff < 0.0 && mid_diff < 0.0 && mid_diff < diff));
-        if (missed_opposite || missed_overshoot) diff += (diff > 0.0) ? -6.2831853072 : 6.2831853072;
-        if (a.center_angle > 0.5f)                diff += (diff > 0.0) ? -6.2831853072 : 6.2831853072;
-
-        sweep = diff;
-        return true;
-    }
-
-    // ========================================================================
-    //  CONTROL PANEL
-    // ========================================================================
     void RenderControlPanelUI() {
         ImGui::Separator();
         ImGui::Text("Flight Geometry:");
@@ -1294,11 +1119,8 @@ namespace MapCanvas {
         }
 
         ImGui::Separator();
-        ImGui::Text("Mission Generation:");
+        ImGui::Text("Mission Generation Parameters:");
 
-        // BUGFIX #20b: SliderInt returns true on EVERY frame of a drag, so the old
-        // code rewrote mission_cache.dat dozens of times per second while the user
-        // held the mouse down. Save once, when the edit finishes.
         ImGui::SliderInt("Mode Threshold", &mode_threshold, 5, 100, "%d m");
         if (ImGui::IsItemDeactivatedAfterEdit()) SaveSession();
         ImGui::SliderInt("Tile Offset", &tile_offset, 0, 20, "%d tiles");
@@ -1322,8 +1144,6 @@ namespace MapCanvas {
                 ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.0f, 1.0f), " (Parsing Terrain...)");
             }
             else if (!elevation_ready) {
-                // BUGFIX #6: exporting with no elevation data produced a file where
-                // every segment was flat. Refuse instead.
                 ImGui::SameLine();
                 ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), " (No elevation data)");
             }
@@ -1346,14 +1166,11 @@ namespace MapCanvas {
                 const int lat = (ORIGIN_LAT_DEG * 3600) - TileOf(waypoints[i].raw_y);
                 const float elev = SampleElevation(TileOf(waypoints[i].raw_x), TileOf(waypoints[i].raw_y));
 
-                // BUGFIX #25 (CRITICAL / crash): this loop indexed waypoints[i+1] and
-                // waypoints[i+2] with NO bounds check. A session file truncated mid-arc,
-                // or a partially deleted arc group, read past the end of the vector.
                 if (waypoints[i].type == WpType::Arc3Pt && i + 2 < waypoints.size()) {
                     double Xc, Yc, R, sa, sweep;
                     const double deg = Arc3PtGeometry(waypoints[i], waypoints[i + 1], waypoints[i + 2],
                         Xc, Yc, R, sa, sweep) ? sweep * (180.0 / 3.1415926535) : 0.0;
-                    ImGui::Text("3P-Arc (3C%d): %d\xC2\xB0%02d'%02d\"N  %d\xC2\xB0%02d'%02d\"E | %.1f\xC2\xB0",
+                    ImGui::Text("3P-Arc (3C%d): %d\xC2\xB0%02d'%02d\"N  %d\xC2\xB0%02d'%02d\"E  | %.1f\xC2\xB0",
                         waypoints[i].group_id, lat / 3600, (lat % 3600) / 60, lat % 60,
                         lon / 3600, (lon % 3600) / 60, lon % 60, deg);
                     i += 3;
@@ -1383,7 +1200,9 @@ namespace MapCanvas {
         for (size_t i = 0; i < waypoints.size(); ) {
             auto bridge = [&](size_t idx) {
                 if (idx == 0) return;
-                const float ddx = waypoints[idx].raw_x - last_x;
+                const double lat_rad = (ORIGIN_LAT_DEG - (waypoints[idx].raw_y / 3600.0)) * (3.1415926535 / 180.0);
+                const double cos_lat = std::cos(lat_rad);
+                const float ddx = (waypoints[idx].raw_x - last_x) * (float)cos_lat;
                 const float ddy = waypoints[idx].raw_y - last_y;
                 const float d = std::sqrt(ddx * ddx + ddy * ddy) * METERS_PER_TILE;
                 if (d > 0.1f) { ImGui::Text("Line: %.1f m", d); total_distance += d; }
@@ -1412,9 +1231,12 @@ namespace MapCanvas {
             }
             else if (waypoints[i].type == WpType::ArcCenterAnchor && i + 1 < waypoints.size()) {
                 bridge(i);
-                const double sx = waypoints[i].raw_x, sy = waypoints[i].raw_y;
-                const double cx = waypoints[i + 1].raw_x, cy = waypoints[i + 1].raw_y;
-                const double dx = sx - cx, dy = sy - cy;
+
+                const double lat_rad = (ORIGIN_LAT_DEG - (waypoints[i].raw_y / 3600.0)) * (3.1415926535 / 180.0);
+                const double cos_lat = std::cos(lat_rad);
+                const double sx_iso = (double)waypoints[i].raw_x * cos_lat, sy = (double)waypoints[i].raw_y;
+                const double cx_iso = (double)waypoints[i + 1].raw_x * cos_lat, cy = (double)waypoints[i + 1].raw_y;
+                const double dx = sx_iso - cx_iso, dy = sy - cy;
                 const double R = std::sqrt(dx * dx + dy * dy);
                 const double sweep = waypoints[i + 1].center_angle * (3.1415926535 / 180.0);
                 const float arc_len = (float)(R * std::abs(sweep)) * METERS_PER_TILE;
@@ -1430,7 +1252,7 @@ namespace MapCanvas {
 
                 total_distance += arc_len;
                 const double ea = std::atan2(dy, dx) + sweep;
-                last_x = (float)(cx + R * std::cos(ea));
+                last_x = (float)((cx_iso + R * std::cos(ea)) / cos_lat);
                 last_y = (float)(cy + R * std::sin(ea));
                 i += 2;
             }
@@ -1445,8 +1267,6 @@ namespace MapCanvas {
         ImGui::Separator();
         ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "Total Distance: %.1f m", total_distance);
 
-        // Mission summary straight off the shared profile, so the numbers here are
-        // provably the ones that will be exported.
         const MissionProfile& mp = GetMissionProfile();
         if (!mp.steps.empty()) {
             int n_climb = 0, n_desc = 0, n_level = 0;
@@ -1464,14 +1284,7 @@ namespace MapCanvas {
         ImGui::Spacing();
     }
 
-    // ========================================================================
-    //  SESSION PERSISTENCE
-    // ========================================================================
-    // BUGFIX #20: the old format had no magic number, no version and no validation.
-    // LoadSession read a size_t straight off disk and passed it to vector::resize,
-    // so a truncated, stale or foreign mission_cache.dat could request an arbitrary
-    // allocation, then read uninitialised Waypoints into the mission.
-    static const uint32_t SESSION_MAGIC = 0x4E564152u;   // 'RAVN'
+    static const uint32_t SESSION_MAGIC = 0x4E564152u;
     static const uint32_t SESSION_VERSION = 2u;
     static const uint64_t SESSION_MAX_WPS = 100000u;
 
@@ -1505,7 +1318,7 @@ namespace MapCanvas {
         file.read((char*)&stride, sizeof(stride));
         if (!file || magic != SESSION_MAGIC || version != SESSION_VERSION ||
             stride != (uint32_t)sizeof(Waypoint))
-            return;   // pre-v2 or foreign cache: start clean rather than misparse
+            return;
 
         file.read((char*)&show_minute_grid, sizeof(bool));
         file.read((char*)&show_second_grid, sizeof(bool));
@@ -1521,15 +1334,13 @@ namespace MapCanvas {
         std::vector<Waypoint> loaded((size_t)wp_count);
         if (wp_count) {
             file.read((char*)loaded.data(), (std::streamsize)(wp_count * sizeof(Waypoint)));
-            if (!file) return;   // truncated: keep the in-memory mission untouched
+            if (!file) return;
         }
 
-        // Clamp the sliders in case the file predates a range change.
         mode_threshold = Clamp(mode_threshold, 5, 100);
         tile_offset = Clamp(tile_offset, 0, 20);
         step_grouping = Clamp(step_grouping, 1, 20);
 
-        // Drop any waypoint outside the raster instead of trusting it later.
         for (auto& w : loaded) {
             w.raw_x = Clamp(w.raw_x, 0.0f, (float)(MAP_W - 1));
             w.raw_y = Clamp(w.raw_y, 0.0f, (float)(MAP_H - 1));
@@ -1541,25 +1352,9 @@ namespace MapCanvas {
         InvalidateProfile();
     }
 
-    // ========================================================================
-    //  F-CODE EXPORT
-    // ========================================================================
     void ExportMissionFCode() {
         if (waypoints.size() < 2) return;
-        if (!elevation_ready) return;                       // BUGFIX #6
-
-        // BUGFIX #11: the exporter now consumes the SAME profile the canvas drew.
-        // It no longer owns a second raycast / grouping / classification pipeline.
-        const MissionProfile& mp = GetMissionProfile();
-        if (mp.tiles.size() < 2) return;
-
-        if (mp.left_map) {
-            if (MessageBoxA(NULL,
-                "Part of this flight path lies outside the DEM coverage area.\n"
-                "Elevations there are clamped to the nearest edge sample and the\n"
-                "climb/descend zones near the boundary may be wrong.\n\nExport anyway?",
-                "RAVEN - Coverage Warning", MB_YESNO | MB_ICONWARNING) != IDYES) return;
-        }
+        if (!elevation_ready) return;
 
         auto format_wp = [](const Waypoint& wp) {
             const int lon = (ORIGIN_LON_DEG * 3600) + TileOf(wp.raw_x);
@@ -1573,12 +1368,10 @@ namespace MapCanvas {
 
         const std::string default_name = format_wp(waypoints.front()) + "-" +
             format_wp(waypoints.back()) + "-" +
-            std::to_string(waypoints.size()) + ".txt";
+            std::to_string(waypoints.size()) + ".fcode";
 
         OPENFILENAMEA ofn;
         char szFile[MAX_PATH];
-        // BUGFIX #9: strncpy(dst, src, sizeof(dst)) leaves dst UNTERMINATED when src
-        // is at least as long as dst, and GetSaveFileNameA then reads past the buffer.
         snprintf(szFile, sizeof(szFile), "%s", default_name.c_str());
 
         ZeroMemory(&ofn, sizeof(ofn));
@@ -1586,80 +1379,137 @@ namespace MapCanvas {
         ofn.hwndOwner = NULL;
         ofn.lpstrFile = szFile;
         ofn.nMaxFile = sizeof(szFile);
-        ofn.lpstrFilter = "Text Files\0*.txt\0All Files\0*.*\0";
+        ofn.lpstrFilter = "F-Code Files\0*.fcode\0All Files\0*.*\0";
         ofn.nFilterIndex = 1;
-        ofn.lpstrDefExt = "txt";
+        ofn.lpstrDefExt = "fcode";
         ofn.Flags = OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT;
 
         if (GetSaveFileNameA(&ofn) != TRUE) return;
 
         std::ofstream file(ofn.lpstrFile);
-        if (!file.is_open()) {
-            MessageBoxA(NULL, "Could not open the destination file for writing.",
-                "RAVEN - Export Failed", MB_OK | MB_ICONERROR);
-            return;
-        }
+        if (!file.is_open()) return;
 
-        // Expand the per-step modes to per-tile so the writer is a flat walk.
-        std::vector<int> tile_mode(mp.tiles.size(), MODE_LEVEL);
-        for (size_t s = 0; s < mp.steps.size(); s++)
-            for (int ti = mp.steps[s].first; ti <= mp.steps[s].last; ti++)
-                tile_mode[(size_t)ti] = mp.modes[s];
-
-        // OPT: build the whole file in memory and write once. The old loop did one
-        // formatted ofstream insertion per tile; on a long mission that is tens of
-        // thousands of unbuffered-ish writes.
         std::string out;
-        out.reserve(mp.tiles.size() * 40 + 64);
+        out.reserve(waypoints.size() * 64 + 128);
         out += "%\n";
-        out += "F43; Z50;\n";
 
-        char line[160];
-        int emitted_mode = -1;
-        const size_t n = mp.tiles.size();
+        char line[128];
+        snprintf(line, sizeof(line), "F43 Z%d;\n", mode_threshold * 4);
+        out += line;
 
-        for (size_t f = 0; f < n; f++) {
-            const ProfileTile& t = mp.tiles[f];
-            const int total_lon_sec = (ORIGIN_LON_DEG * 3600) + t.x;
-            const int total_lat_sec = (ORIGIN_LAT_DEG * 3600) - t.y;
-            const int lon_d = total_lon_sec / 3600, lon_m = (total_lon_sec % 3600) / 60, lon_s = total_lon_sec % 60;
-            const int lat_d = total_lat_sec / 3600, lat_m = (total_lat_sec % 3600) / 60, lat_s = total_lat_sec % 60;
-            const int mode = tile_mode[f];
+        const int start_lon_sec = (ORIGIN_LON_DEG * 3600) + TileOf(waypoints[0].raw_x);
+        const int start_lat_sec = (ORIGIN_LAT_DEG * 3600) - TileOf(waypoints[0].raw_y);
+        snprintf(line, sizeof(line), "F90 X%02d%02d%02d Y%02d%02d%02d;\n",
+            start_lon_sec / 3600, (start_lon_sec % 3600) / 60, start_lon_sec % 60,
+            start_lat_sec / 3600, (start_lat_sec % 3600) / 60, start_lat_sec % 60);
+        out += line;
 
-            if (f == 0) {
-                snprintf(line, sizeof(line), "F91; X%02d%02d%02d; Y%02d%02d%02d; N40;\n",
-                    lon_d, lon_m, lon_s, lat_d, lat_m, lat_s);
-                emitted_mode = mode;
-            }
-            else if (f == n - 1) {
-                // BUGFIX #10: a mode change landing on the final tile used to be
-                // swallowed by the N39 terminator. Emit both words. If your firmware
-                // accepts only one N word per line, drop the N%02d here.
-                if (mode != emitted_mode) {
-                    snprintf(line, sizeof(line), "F91; X%02d%02d%02d; Y%02d%02d%02d; N%02d; N39;\n",
-                        lon_d, lon_m, lon_s, lat_d, lat_m, lat_s, mode);
-                    emitted_mode = mode;
+        double current_x = waypoints[0].raw_x;
+        double current_y = waypoints[0].raw_y;
+
+        for (size_t i = 0; i < waypoints.size(); ) {
+            const double lat_rad = (ORIGIN_LAT_DEG - (waypoints[i].raw_y / 3600.0)) * (3.1415926535 / 180.0);
+            const double cos_lat = std::cos(lat_rad);
+
+            if (waypoints[i].type == WpType::Arc3Pt && i + 2 < waypoints.size()) {
+                double Xc, Yc, R, sa, sweep;
+                if (Arc3PtGeometry(waypoints[i], waypoints[i + 1], waypoints[i + 2], Xc, Yc, R, sa, sweep)) {
+
+                    int arc_type = (sweep >= 0.0) ? 2 : 3;
+                    double R_meters = R * METERS_PER_TILE;
+                    double sweep_deg = std::abs(sweep) * (180.0 / 3.1415926535);
+
+                    double ex = waypoints[i + 2].raw_x;
+                    double ey = waypoints[i + 2].raw_y;
+
+                    int end_lon = (ORIGIN_LON_DEG * 3600) + TileOf((float)ex);
+                    int end_lat = (ORIGIN_LAT_DEG * 3600) - TileOf((float)ey);
+
+                    int c_lon = (ORIGIN_LON_DEG * 3600) + (int)std::round(Xc);
+                    int c_lat = (ORIGIN_LAT_DEG * 3600) - (int)std::round(Yc);
+
+                    double dx = waypoints[i].raw_x - current_x;
+                    double dy = -(waypoints[i].raw_y - current_y);
+
+                    if (std::abs(dx) > 0.1 || std::abs(dy) > 0.1) {
+                        snprintf(line, sizeof(line), "F01 X%.1f Y%.1f;\n", dx, dy);
+                        out += line;
+                    }
+
+                    snprintf(line, sizeof(line), "F%02d I%02d%02d%02d J%02d%02d%02d R%.1f A%.1f X%02d%02d%02d Y%02d%02d%02d;\n",
+                        arc_type,
+                        c_lon / 3600, (c_lon % 3600) / 60, c_lon % 60,
+                        c_lat / 3600, (c_lat % 3600) / 60, c_lat % 60,
+                        R_meters, sweep_deg,
+                        end_lon / 3600, (end_lon % 3600) / 60, end_lon % 60,
+                        end_lat / 3600, (end_lat % 3600) / 60, end_lat % 60);
+                    out += line;
+
+                    current_x = ex;
+                    current_y = ey;
                 }
-                else {
-                    snprintf(line, sizeof(line), "F91; X%02d%02d%02d; Y%02d%02d%02d; N39;\n",
-                        lon_d, lon_m, lon_s, lat_d, lat_m, lat_s);
-                }
+                i += 3;
             }
-            else if (mode != emitted_mode) {
-                snprintf(line, sizeof(line), "F91; X%02d%02d%02d; Y%02d%02d%02d; N%02d;\n",
-                    lon_d, lon_m, lon_s, lat_d, lat_m, lat_s, mode);
-                emitted_mode = mode;
+            else if (waypoints[i].type == WpType::ArcCenterAnchor && i + 1 < waypoints.size()) {
+                double sx_iso = (double)waypoints[i].raw_x * cos_lat, sy = (double)waypoints[i].raw_y;
+                double cx_iso = (double)waypoints[i + 1].raw_x * cos_lat, cy = (double)waypoints[i + 1].raw_y;
+                double dx_iso = sx_iso - cx_iso, dy_iso = sy - cy;
+                double R = std::sqrt(dx_iso * dx_iso + dy_iso * dy_iso);
+
+                double start_angle = std::atan2(dy_iso, dx_iso);
+                double sweep_angle = waypoints[i + 1].center_angle * (3.1415926535 / 180.0);
+                int arc_type = (sweep_angle >= 0.0) ? 2 : 3;
+                double R_meters = R * METERS_PER_TILE;
+                double sweep_deg = std::abs(waypoints[i + 1].center_angle);
+
+                double end_a = start_angle + sweep_angle;
+                double ex = (cx_iso + R * std::cos(end_a)) / cos_lat;
+                double ey = cy + R * std::sin(end_a);
+
+                int end_lon = (ORIGIN_LON_DEG * 3600) + TileOf((float)ex);
+                int end_lat = (ORIGIN_LAT_DEG * 3600) - TileOf((float)ey);
+
+                int c_lon = (ORIGIN_LON_DEG * 3600) + (int)std::round(waypoints[i + 1].raw_x);
+                int c_lat = (ORIGIN_LAT_DEG * 3600) - (int)std::round(waypoints[i + 1].raw_y);
+
+                double dx = waypoints[i].raw_x - current_x;
+                double dy = -(waypoints[i].raw_y - current_y);
+
+                if (std::abs(dx) > 0.1 || std::abs(dy) > 0.1) {
+                    snprintf(line, sizeof(line), "F01 X%.1f Y%.1f;\n", dx, dy);
+                    out += line;
+                }
+
+                snprintf(line, sizeof(line), "F%02d I%02d%02d%02d J%02d%02d%02d R%.1f A%.1f X%02d%02d%02d Y%02d%02d%02d;\n",
+                    arc_type,
+                    c_lon / 3600, (c_lon % 3600) / 60, c_lon % 60,
+                    c_lat / 3600, (c_lat % 3600) / 60, c_lat % 60,
+                    R_meters, sweep_deg,
+                    end_lon / 3600, (end_lon % 3600) / 60, end_lon % 60,
+                    end_lat / 3600, (end_lat % 3600) / 60, end_lat % 60);
+                out += line;
+
+                current_x = ex;
+                current_y = ey;
+                i += 2;
             }
             else {
-                snprintf(line, sizeof(line), "F91; X%02d%02d%02d; Y%02d%02d%02d;\n",
-                    lon_d, lon_m, lon_s, lat_d, lat_m, lat_s);
+                double dx = waypoints[i].raw_x - current_x;
+                double dy = -(waypoints[i].raw_y - current_y);
+
+                if (std::abs(dx) > 0.1 || std::abs(dy) > 0.1) {
+                    snprintf(line, sizeof(line), "F01 X%.1f Y%.1f;\n", dx, dy);
+                    out += line;
+                }
+                current_x = waypoints[i].raw_x;
+                current_y = waypoints[i].raw_y;
+                i++;
             }
-            out += line;
         }
 
-        out += "%\n";
+        out += "F39;\n%\n";
         file << out;
         file.close();
     }
 
-} // namespace MapCanvas
+}

@@ -11,7 +11,7 @@ void RenderAppUI() {
     ImGui::Begin("F-Code Generator", nullptr, window_flags);
 
     // --- Build the Left Control Panel ---
-    ImGui::BeginChild("ControlPanel", ImVec2(350, 0), true);
+    ImGui::BeginChild("ControlPanel", ImVec2(400, 0), true);
     ImGui::Text("Waypoint Configuration");
     ImGui::Separator();
 
